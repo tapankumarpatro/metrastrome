@@ -1,0 +1,20 @@
+# Core orchestration
+autogen-agentchat>=0.4.0
+autogen-ext[openai]>=0.4.0
+
+# WebSocket server
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+websockets>=14.0
+
+# TTS (Microsoft Edge neural voices)
+edge-tts
+
+# HTTP client (for OpenRouter, Kie.ai API calls)
+aiohttp
+
+# Environment
+python-dotenv
+
+# Logging
+loguru

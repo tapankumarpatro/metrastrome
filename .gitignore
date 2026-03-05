@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+conda-env/
+
+# Node
+node_modules/
+.next/
+out/
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Model weights (large files)
+backend/models/
+backend/vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Misc
+*.onnx
+*.bin
+!backend/requirements.txt
+
+# Generated images (keep directory via .gitkeep)
+frontend/public/images/*.jpg
+frontend/public/images/*.png
+!frontend/public/images/.gitkeep
+
+# Test artifacts
+*.mp4

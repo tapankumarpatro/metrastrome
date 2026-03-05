@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    container_name: metabrain-livekit
+    ports:
+      - "7880:7880"   # HTTP / WebSocket
+      - "7881:7881"   # RTC (TCP)
+      - "7882:7882/udp" # RTC (UDP)
+    environment:
+      LIVEKIT_KEYS: "devkey: devsecret"
+    command: >
+      --dev
+      --bind 0.0.0.0
+      --port 7880
+    restart: unless-stopped
+    depends_on:
+      - redis
+
+  redis:
+    image: redis:7-alpine
+    container_name: metabrain-redis
+    ports:
+      - "6379:6379"
+    restart: unless-stopped

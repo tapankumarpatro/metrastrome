@@ -1,0 +1,65 @@
+# ────────────────────────────────────────────────────────────────────
+# Metrastrome — The Multiverse of You
+#
+# Usage:
+#   docker compose up --build          # first time / after code changes
+#   docker compose up -d               # detached (background)
+#   docker compose down                # stop everything
+#   docker compose restart backend     # restart just the backend
+#   docker compose logs -f backend     # tail backend logs
+# ────────────────────────────────────────────────────────────────────
+
+services:
+  # ── Backend: FastAPI + AutoGen on port 8000 ──
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: metrastrome-backend
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./backend/.env
+    volumes:
+      # agents.config.json at project root
+      # Backend resolves: Path(__file__).parent.parent.parent / "agents.config.json" → /agents.config.json
+      - ./agents.config.json:/agents.config.json
+      # Backend writes generated portraits to IMAGES_DIR:
+      # Path(__file__).parent.parent / "frontend/public/images" → /frontend/public/images
+      - ./frontend/public/images:/frontend/public/images
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # ── Frontend: Next.js on port 3001 ──
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8000
+        NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    container_name: metrastrome-frontend
+    ports:
+      - "3001:3000"
+    volumes:
+      # Serve the same generated agent images that the backend writes
+      - ./frontend/public/images:/app/public/images
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
