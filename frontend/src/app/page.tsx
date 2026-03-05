@@ -165,8 +165,10 @@ function AgentCard({
   return (
     <button
       onClick={onToggle}
-      className={`group relative h-full w-full overflow-hidden focus:outline-none ${
-        isEnabled ? "opacity-100" : "opacity-85 hover:opacity-100"
+      className={`group relative h-full w-full overflow-hidden rounded-xl transition-all duration-300 focus:outline-none ${
+        isEnabled
+          ? "ring-2 ring-emerald-400 ring-offset-2 ring-offset-slate-950 shadow-lg shadow-emerald-500/20 scale-[1.02]"
+          : "ring-1 ring-white/10 opacity-70 hover:opacity-100 hover:ring-white/30"
       }`}
     >
       {/* Photo or emoji fallback */}
@@ -174,12 +176,12 @@ function AgentCard({
         <img
           src={agent.image}
           alt={agent.variant}
-          className="absolute inset-0 h-full w-full object-cover object-top"
+          className="absolute inset-0 h-full w-full rounded-xl object-cover object-top"
           loading="lazy"
           onError={() => setImgError(true)}
         />
       ) : (
-        <div className={`absolute inset-0 flex items-center justify-center ${agent.iconBg} bg-opacity-100`}>
+        <div className={`absolute inset-0 flex items-center justify-center rounded-xl ${agent.iconBg} bg-opacity-100`}>
           <span className="text-7xl select-none" style={{ filter: "drop-shadow(0 4px 12px rgba(0,0,0,0.3))" }}>
             {agent.emoji || "🤖"}
           </span>
@@ -187,11 +189,15 @@ function AgentCard({
       )}
 
       {/* Gradient overlay */}
-      <div className="absolute inset-0 bg-gradient-to-t from-black/60 via-black/5 to-transparent" />
+      <div className="absolute inset-0 rounded-xl bg-gradient-to-t from-black/60 via-black/5 to-transparent" />
 
-      {/* Selected indicator */}
+      {/* Selected indicator — checkmark badge */}
       {isEnabled && (
-        <div className="absolute right-2.5 top-2.5 h-3 w-3 rounded-full bg-blue-500 shadow-sm shadow-blue-500/50" />
+        <div className="absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-full bg-emerald-500 shadow-md shadow-emerald-500/40">
+          <svg className="h-3.5 w-3.5 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+          </svg>
+        </div>
       )}
 
       {/* Name overlaid */}
