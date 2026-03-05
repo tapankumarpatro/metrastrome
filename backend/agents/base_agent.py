@@ -9,6 +9,7 @@ speaker selection, `system_prompt` is assembled from structured data.
 """
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List
@@ -120,6 +121,20 @@ def _load_config_json() -> dict:
     return {"agents": []}
 
 
+def _sanitize_agent_name(raw: str) -> str:
+    """Convert any string into a valid Python identifier for AutoGen.
+    E.g. 'Elon Musk' -> 'ElonMusk', 'tapan-visionary' -> 'TapanVisionary'."""
+    # Remove everything except alphanumeric and spaces/hyphens/underscores
+    cleaned = re.sub(r"[^a-zA-Z0-9 _\-]", "", raw)
+    # Split on non-alpha separators and title-case each part
+    parts = re.split(r"[\s\-_]+", cleaned)
+    name = "".join(p.capitalize() for p in parts if p)
+    # Ensure it doesn't start with a digit
+    if name and name[0].isdigit():
+        name = "Agent" + name
+    return name or "UnnamedAgent"
+
+
 def load_agents_from_json() -> Dict[str, AgentConfig]:
     """Load all agents from agents.config.json and return a registry dict."""
     config = _load_config_json()
@@ -134,7 +149,7 @@ def load_agents_from_json() -> Dict[str, AgentConfig]:
         system_prompt = agent_data.get("system_prompt_override") or _build_system_prompt(agent_data)
 
         cfg = AgentConfig(
-            agent_name=agent_data.get("agent_name", agent_id.replace("-", "").title()),
+            agent_name=_sanitize_agent_name(agent_data.get("agent_name", agent_id)),
             identity=agent_id,
             variant=agent_data.get("variant", agent_id),
             description=agent_data.get("description", ""),
