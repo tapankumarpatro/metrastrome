@@ -353,7 +353,7 @@ class ChatSession:
       they "remember" previous sessions.
     """
 
-    MAX_AGENT_REPLIES_PER_TURN = 3  # At most 3 agents speak per user message
+    MAX_AGENT_REPLIES_PER_TURN = 2  # At most 2 agents speak per user message (fast turns)
 
     def __init__(self, agent_configs: list[AgentConfig], user_name: str = "", enable_video: bool = False):
         self.model_client = build_model_client()
@@ -425,6 +425,67 @@ class ChatSession:
             logger.info(f"Created agent: {cfg.agent_name} ({cfg.variant})")
         return agents
 
+    def _keyword_selector(self, messages) -> str | None:
+        """Fast, no-LLM speaker selection based on keyword matching.
+        ALWAYS returns an agent name — never None (avoids slow LLM fallback).
+        Also sends an agent_typing event via _active_ws if available."""
+        import random
+
+        # Determine who has already spoken this round
+        already_spoke = set()
+        for msg in messages:
+            src = getattr(msg, "source", "")
+            if src and src != "user":
+                already_spoke.add(src)
+
+        # Available agents (haven't spoken yet)
+        available = [c for c in self.agent_configs if c.agent_name not in already_spoke]
+        if not available:
+            available = list(self.agent_configs)  # all spoke, allow repeat
+
+        # Get the last user message text for keyword scoring
+        last_text = ""
+        for msg in reversed(messages):
+            content = getattr(msg, "content", "") or ""
+            source = getattr(msg, "source", "")
+            if source == "user" or not source:
+                last_text = content.lower()
+                break
+
+        # Score each available agent by keyword overlap
+        scored = []
+        for cfg in available:
+            keywords = set()
+            for e in cfg.expertise:
+                keywords.update(e.lower().split())
+            keywords.update(cfg.personality.lower().replace(",", " ").split())
+            score = sum(1 for kw in keywords if kw in last_text and len(kw) > 3)
+            scored.append((cfg.agent_name, score))
+
+        # Sort by score descending, pick top or random from top ties
+        scored.sort(key=lambda x: -x[1])
+        if scored[0][1] > 0:
+            # Pick the best match
+            picked = scored[0][0]
+        else:
+            # No keyword match — pick randomly from available
+            picked = random.choice(available).agent_name
+
+        logger.info(f"[Selector] Picked: {picked} (from {len(available)} available, already_spoke={already_spoke})")
+
+        # Send typing indicator via the active WebSocket (if set)
+        if hasattr(self, '_active_ws') and self._active_ws:
+            cfg = next((c for c in self.agent_configs if c.agent_name == picked), None)
+            if cfg:
+                asyncio.get_event_loop().create_task(
+                    self._active_ws.send_json({
+                        "type": "agent_typing",
+                        "agent_id": cfg.identity,
+                        "variant": cfg.variant,
+                    })
+                )
+        return picked
+
     def _build_team(self):
         """Build (or rebuild) the team with a per-round message cap."""
         n_agents = len(self.agents)
@@ -439,6 +500,7 @@ class ChatSession:
                 termination_condition=termination,
                 selector_prompt=SELECTOR_PROMPT,
                 allow_repeated_speaker=False,
+                selector_func=self._keyword_selector,
             )
         else:
             self.team = RoundRobinGroupChat(
@@ -446,11 +508,17 @@ class ChatSession:
                 termination_condition=termination,
             )
         logger.info(
-            f"Team built: {n_agents} agent(s), max {replies} replies per turn"
+            f"Team built: {n_agents} agent(s), max {replies} replies per turn (fast selector)"
         )
 
     async def handle_message(self, user_message: str, websocket: WebSocket):
         """Process one user message: get agent replies, send text + audio."""
+        import time as _time
+        t0 = _time.time()
+        logger.info(f"[handle_message] Processing: {user_message[:60]}...")
+
+        # Store websocket ref so the selector can send typing events
+        self._active_ws = websocket
 
         # Prepend recent conversation history to the user message so agents
         # have context, but the team itself starts fresh each round.
@@ -501,11 +569,16 @@ class ChatSession:
                     )
                 )
 
+                elapsed = _time.time() - t0
+                logger.info(f"[handle_message] Agent {variant_name} replied in {elapsed:.1f}s")
                 agent_replies.append({"variant": variant_name, "content": content, "agent_id": agent_id})
 
         except Exception as e:
-            logger.error(f"Error in group chat: {e}")
+            logger.error(f"Error in group chat: {e}", exc_info=True)
             await websocket.send_json({"type": "error", "content": str(e)})
+
+        total = _time.time() - t0
+        logger.info(f"[handle_message] Complete: {len(agent_replies)} replies in {total:.1f}s")
 
         # Update manual conversation history (keep last 10 exchanges)
         self.conversation_history.append({"role": "user", "text": user_message})

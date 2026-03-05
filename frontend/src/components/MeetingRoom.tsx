@@ -33,6 +33,7 @@ export function MeetingRoom({
   const [chatInput, setChatInput] = useState("");
   const [isConnected, setIsConnected] = useState(false);
   const [isThinking, setIsThinking] = useState(false);
+  const [thinkingAgent, setThinkingAgent] = useState<string | null>(null);
   const [speakingAgentId, setSpeakingAgentId] = useState<string | null>(null);
   const [agentVideos, setAgentVideos] = useState<Record<string, string>>({});
   const [isMuted, setIsMuted] = useState(true);
@@ -149,8 +150,12 @@ export function MeetingRoom({
     ws.onmessage = (event) => {
       const data = JSON.parse(event.data);
 
-      if (data.type === "agent_message") {
+      if (data.type === "agent_typing") {
+        setIsThinking(true);
+        setThinkingAgent(data.variant || data.agent_id);
+      } else if (data.type === "agent_message") {
         setIsThinking(false);
+        setThinkingAgent(null);
         setSpeakingAgentId(data.agent_id);
         setMessages((prev) => [
           ...prev,
@@ -350,11 +355,13 @@ export function MeetingRoom({
               {isThinking && (
                 <div className="flex items-center gap-2 px-2">
                   <div className="flex gap-1">
-                    <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-500" style={{ animationDelay: "0ms" }} />
-                    <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-500" style={{ animationDelay: "150ms" }} />
-                    <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-zinc-500" style={{ animationDelay: "300ms" }} />
+                    <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-500" style={{ animationDelay: "0ms" }} />
+                    <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-500" style={{ animationDelay: "150ms" }} />
+                    <div className="h-1.5 w-1.5 animate-bounce rounded-full bg-violet-500" style={{ animationDelay: "300ms" }} />
                   </div>
-                  <span className="text-[10px] text-zinc-600">Thinking...</span>
+                  <span className="text-[10px] text-zinc-400">
+                    {thinkingAgent ? `${thinkingAgent} is typing...` : "Agents are thinking..."}
+                  </span>
                 </div>
               )}
               <div ref={chatEndRef} />
