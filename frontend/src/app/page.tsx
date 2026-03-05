@@ -17,9 +17,7 @@ export default function Home() {
   const [isJoining, setIsJoining] = useState(false);
   const [agents, setAgents] = useState<AgentInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [enabledAgents, setEnabledAgents] = useState<Set<string>>(
-    new Set(DEFAULT_ENABLED_AGENTS)
-  );
+  const [enabledAgents, setEnabledAgents] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (!isProfileComplete()) {
@@ -33,6 +31,8 @@ export default function Home() {
     fetchAgents().then((data) => {
       setAgents(data);
       setAgentsCache(data);
+      // Auto-enable all agents on first load
+      setEnabledAgents(new Set(data.map((a) => a.id)));
       setLoading(false);
     });
   }, [router]);
@@ -57,13 +57,12 @@ export default function Home() {
   };
 
   const gridCols =
-    agents.length <= 3
-      ? "grid-cols-3"
-      : agents.length <= 4
-        ? "grid-cols-4"
-        : agents.length <= 6
-          ? "grid-cols-3 grid-rows-2"
-          : "grid-cols-4 grid-rows-2";
+    agents.length <= 3 ? "grid-cols-3"
+    : agents.length <= 4 ? "grid-cols-4"
+    : agents.length <= 6 ? "grid-cols-3"
+    : agents.length <= 8 ? "grid-cols-4"
+    : agents.length <= 12 ? "grid-cols-4"
+    : "grid-cols-5";
 
   return (
     <div className="flex h-screen flex-col overflow-hidden bg-white">
@@ -119,7 +118,7 @@ export default function Home() {
       </header>
 
       {/* ── Agent card grid ── */}
-      <main className="flex-1 min-h-0 px-6 py-3">
+      <main className="flex-1 min-h-0 overflow-y-auto px-6 py-3">
         {loading ? (
           <div className="flex h-full items-center justify-center">
             <p className="text-sm text-slate-400 animate-pulse">Loading agents from backend...</p>
@@ -131,7 +130,9 @@ export default function Home() {
             </p>
           </div>
         ) : (
-          <div className={`mx-auto grid h-full max-w-[1400px] gap-3 ${gridCols}`}>
+          <div className={`mx-auto grid max-w-[1400px] gap-3 ${gridCols}`}
+            style={{ gridAutoRows: "minmax(160px, 1fr)", height: "100%" }}
+          >
             {agents.map((agent) => (
               <AgentCard
                 key={agent.id}
