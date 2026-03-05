@@ -40,6 +40,7 @@ from pydantic import BaseModel
 import agents.base_agent as agent_module
 from agents.base_agent import AgentConfig, reload_agents, get_config_path
 import conversation_store as convstore
+import memory_store as memstore
 
 load_dotenv(override=True)
 
@@ -379,7 +380,7 @@ class ChatSession:
         self._build_team()
 
     def _build_agents(self) -> list[AssistantAgent]:
-        """Create agents with system prompts that include participant awareness + past memory."""
+        """Create agents with system prompts that include participant awareness + vector-retrieved memory."""
         agents = []
         participant_clause = (
             f"\n\nPARTICIPANTS IN THIS CALL: {self.participant_list_str}. "
@@ -401,18 +402,27 @@ class ChatSession:
             user_clause = f"\n\nThe user's name is {self.user_name}. Address them by name occasionally."
 
         for cfg in self.agent_configs:
-            # Retrieve past conversation context for this agent
-            past_context = convstore.get_conversation_context_for_agent(cfg.identity, max_messages=20)
+            # Retrieve persistent notes for this agent from ChromaDB
+            notes_ctx = memstore.build_agent_notes_context(cfg.identity)
+
+            # Retrieve recent relevant memories from ChromaDB vector store
+            memory_ctx = memstore.build_memory_context(
+                query=f"conversations with {self.user_name or 'user'}",
+                agent_id=cfg.identity,
+                n_results=8,
+            )
+
             memory_section = ""
-            if past_context:
-                memory_section = f"\n\n{past_context}"
-                logger.info(f"Injected {len(past_context)} chars of memory for {cfg.identity}")
+            if notes_ctx or memory_ctx:
+                parts = [p for p in [notes_ctx, memory_ctx] if p]
+                memory_section = "\n\n" + "\n\n".join(parts)
+                logger.info(f"Injected {len(memory_section)} chars of vector memory for {cfg.identity}")
 
             system_msg = (
                 cfg.system_prompt
                 + participant_clause
                 + user_clause
-                + (memory_preamble + memory_section if past_context else "")
+                + (memory_preamble + memory_section if memory_section else "")
             )
 
             agent = AssistantAgent(
@@ -601,20 +611,73 @@ class ChatSession:
                 reply["variant"],
             )
 
+        # Persist to ChromaDB vector store for semantic retrieval
+        if agent_replies:
+            memstore.store_group_round(
+                session_id=self.session_id,
+                user_message=user_message,
+                agent_replies=agent_replies,
+                user_name=self.user_name,
+            )
+
+            # Generate and store agent notes (background, non-blocking)
+            asyncio.create_task(
+                self._generate_agent_notes(user_message, agent_replies)
+            )
+
+    async def _generate_agent_notes(self, user_message: str, agent_replies: list[dict]):
+        """Background task: ask the LLM to generate brief notes about the conversation
+        for each agent, then store them in ChromaDB for future sessions."""
+        for reply in agent_replies:
+            agent_id = reply.get("agent_id", "")
+            variant = reply.get("variant", "")
+            content = reply.get("content", "")
+            if not agent_id:
+                continue
+
+            note_prompt = (
+                f"You are {variant}. Summarize this exchange in 1-2 sentences as a note "
+                f"about the user ({self.user_name or 'User'}) for your future reference. "
+                f"Focus on what the user cares about, what was discussed, and any commitments made.\n\n"
+                f"User said: {user_message[:300]}\n"
+                f"You replied: {content[:300]}\n\n"
+                f"Write ONLY the note, nothing else:"
+            )
+
+            try:
+                from autogen_core.models import UserMessage as CoreUserMessage
+                result = await self.model_client.create([CoreUserMessage(content=note_prompt, source="user")])
+                note_text = result.content.strip() if hasattr(result, "content") else str(result)
+                if note_text and len(note_text) > 10:
+                    memstore.store_agent_note(agent_id, variant, note_text)
+                    # Also save to SQLite for backward compat
+                    convstore.save_agent_notes(agent_id, note_text)
+            except Exception as e:
+                logger.error(f"[Memory] Failed to generate note for {variant}: {e}")
+
     def _build_context(self, user_message: str) -> str:
-        """Build a prompt that includes recent conversation history."""
-        if not self.conversation_history:
-            return user_message
+        """Build a prompt that includes recent conversation history + vector-retrieved memories."""
+        parts = []
 
-        history_lines = []
-        for entry in self.conversation_history[-10:]:
-            history_lines.append(f"{entry['role']}: {entry['text']}")
-        history_str = "\n".join(history_lines)
-
-        return (
-            f"[Previous conversation for context]\n{history_str}\n\n"
-            f"[Latest message from the user]\n{user_message}"
+        # Retrieve relevant memories from ChromaDB based on the current message
+        memory_ctx = memstore.build_memory_context(
+            query=user_message,
+            n_results=3,
         )
+        if memory_ctx:
+            parts.append(memory_ctx)
+
+        # Add recent in-session conversation history
+        if self.conversation_history:
+            history_lines = []
+            for entry in self.conversation_history[-10:]:
+                history_lines.append(f"{entry['role']}: {entry['text']}")
+            history_str = "\n".join(history_lines)
+            parts.append(f"[Previous conversation in this session]\n{history_str}")
+
+        parts.append(f"[Latest message from the user]\n{user_message}")
+
+        return "\n\n".join(parts)
 
 
 async def _generate_and_send_audio(
@@ -1223,6 +1286,14 @@ def main():
         f"{', '.join(enabled_agent_ids)}"
     )
     logger.info(f"Model: {OPENROUTER_MODEL}")
+
+    # Backfill existing SQLite conversations into ChromaDB vector store
+    try:
+        n = memstore.backfill_from_sqlite()
+        if n > 0:
+            logger.info(f"Backfilled {n} past exchanges into ChromaDB")
+    except Exception as e:
+        logger.warning(f"ChromaDB backfill skipped: {e}")
 
     uvicorn.run(app, host=args.host, port=args.port)
 

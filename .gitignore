@@ -51,6 +51,9 @@ npm-debug.log*
 # SQLite databases
 *.db
 
+# ChromaDB vector store
+backend/chroma_data/
+
 # Generated images (keep directory via .gitkeep)
 frontend/public/images/*.jpg
 frontend/public/images/*.png
