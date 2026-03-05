@@ -39,6 +39,7 @@ from autogen_ext.models.openai import OpenAIChatCompletionClient
 from pydantic import BaseModel
 import agents.base_agent as agent_module
 from agents.base_agent import AgentConfig, reload_agents, get_config_path
+import conversation_store as convstore
 
 load_dotenv(override=True)
 
@@ -108,6 +109,27 @@ async def delete_user_photo():
         USER_REFERENCE_PHOTO.unlink()
         logger.info("User reference photo deleted")
     return {"ok": True}
+
+
+# ── Conversation history endpoints ────────────────────────────────────
+
+@app.get("/conversations")
+async def list_conversations(limit: int = 20):
+    """List recent conversation sessions."""
+    sessions = convstore.get_past_sessions(limit=limit)
+    return {"sessions": sessions}
+
+@app.get("/conversations/{session_id}")
+async def get_conversation(session_id: str):
+    """Get all messages for a specific session."""
+    messages = convstore.get_session_messages(session_id)
+    return {"session_id": session_id, "messages": messages}
+
+@app.get("/conversations/agent/{agent_id}")
+async def get_agent_conversations(agent_id: str, limit: int = 30):
+    """Get recent messages from sessions involving a specific agent."""
+    messages = convstore.get_recent_messages(agent_id=agent_id, limit=limit)
+    return {"agent_id": agent_id, "messages": messages}
 
 
 def build_model_client() -> OpenAIChatCompletionClient:
@@ -249,38 +271,77 @@ class ChatSession:
     - A lightweight conversation_history list is maintained manually so
       agents have context of previous exchanges without AutoGen's internal
       state growing unbounded.
+    - Conversations are persisted to SQLite via conversation_store.
+    - Past conversation context is injected into agent system prompts so
+      they "remember" previous sessions.
     """
 
     MAX_AGENT_REPLIES_PER_TURN = 3  # At most 3 agents speak per user message
 
-    def __init__(self, agent_configs: list[AgentConfig]):
+    def __init__(self, agent_configs: list[AgentConfig], user_name: str = ""):
         self.model_client = build_model_client()
         self.agent_configs = agent_configs
         self.conversation_history: list[dict] = []  # manual context window
+        self.user_name = user_name
+
+        # Create a persistent session
+        import uuid
+        self.session_id = f"session-{uuid.uuid4().hex[:12]}"
+        agent_ids = [cfg.identity for cfg in agent_configs]
+        convstore.create_session(self.session_id, agent_ids, user_name)
+        logger.info(f"Created persistent session: {self.session_id}")
 
         # Build participant list string for system prompts
         self.participant_names = [cfg.variant for cfg in agent_configs]
         self.participant_list_str = ", ".join(self.participant_names)
 
-        # Build agents with injected participant awareness
+        # Build agents with injected participant awareness + memory
         self.agents = self._build_agents()
         self.team = None
         self._build_team()
 
     def _build_agents(self) -> list[AssistantAgent]:
-        """Create agents with a system prompt that knows exactly who's in the call."""
+        """Create agents with system prompts that include participant awareness + past memory."""
         agents = []
         participant_clause = (
             f"\n\nPARTICIPANTS IN THIS CALL: {self.participant_list_str}. "
             "Only these variants are present. Do NOT mention or reference any "
             "variant who is not in this list."
         )
+
+        memory_preamble = (
+            "\n\nIMPORTANT MEMORY INSTRUCTIONS: You have access to memories from "
+            "past conversations with this user. Use them naturally — reference past "
+            "discussions, follow up on ideas, and show that you remember the user. "
+            "Do NOT repeat past points verbatim; instead, build on them. "
+            "If the user raises a topic you discussed before, acknowledge it. "
+            "You may occasionally bring up relevant past topics proactively."
+        )
+
+        user_clause = ""
+        if self.user_name:
+            user_clause = f"\n\nThe user's name is {self.user_name}. Address them by name occasionally."
+
         for cfg in self.agent_configs:
+            # Retrieve past conversation context for this agent
+            past_context = convstore.get_conversation_context_for_agent(cfg.identity, max_messages=20)
+            memory_section = ""
+            if past_context:
+                memory_section = f"\n\n{past_context}"
+                logger.info(f"Injected {len(past_context)} chars of memory for {cfg.identity}")
+
+            system_msg = (
+                cfg.system_prompt
+                + participant_clause
+                + user_clause
+                + (memory_preamble + memory_section if past_context else "")
+            )
+
             agent = AssistantAgent(
                 name=cfg.agent_name,
                 description=cfg.description,
                 model_client=self.model_client,
-                system_message=cfg.system_prompt + participant_clause,
+                system_message=system_msg,
             )
             agents.append(agent)
             logger.info(f"Created agent: {cfg.agent_name} ({cfg.variant})")
@@ -343,7 +404,7 @@ class ChatSession:
                 agent_id = agent_cfg.identity if agent_cfg else source
                 variant_name = agent_cfg.variant if agent_cfg else source
 
-                # Send text message immediately
+                # Send text message immediately — don't block on TTS
                 await websocket.send_json({
                     "type": "agent_message",
                     "agent_id": agent_id,
@@ -353,31 +414,15 @@ class ChatSession:
                 })
                 logger.debug(f"[{source}] {content[:80]}...")
 
-                # Generate TTS audio
+                # Fire TTS + optional video as background task (non-blocking)
                 voice = agent_cfg.voice if agent_cfg else "en-US-AndrewMultilingualNeural"
-                try:
-                    audio_bytes = await generate_tts(content, voice)
-                    if audio_bytes:
-                        audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
-                        await websocket.send_json({
-                            "type": "agent_audio",
-                            "agent_id": agent_id,
-                            "variant": variant_name,
-                            "audio": audio_b64,
-                            "format": "mp3",
-                        })
+                asyncio.create_task(
+                    _generate_and_send_audio(
+                        websocket, content, voice, agent_id, variant_name
+                    )
+                )
 
-                        # Fire off MuseTalk video generation in background
-                        if MUSETALK_ENABLED:
-                            asyncio.create_task(
-                                _generate_and_send_video(
-                                    websocket, agent_id, variant_name, audio_bytes
-                                )
-                            )
-                except Exception as tts_err:
-                    logger.warning(f"TTS failed for {source}: {tts_err}")
-
-                agent_replies.append({"variant": variant_name, "content": content})
+                agent_replies.append({"variant": variant_name, "content": content, "agent_id": agent_id})
 
         except Exception as e:
             logger.error(f"Error in group chat: {e}")
@@ -394,6 +439,16 @@ class ChatSession:
         if len(self.conversation_history) > 20:
             self.conversation_history = self.conversation_history[-20:]
 
+        # Persist to SQLite
+        convstore.add_message(self.session_id, "user", user_message, self.user_name or "User")
+        for reply in agent_replies:
+            convstore.add_message(
+                self.session_id,
+                reply.get("agent_id", reply["variant"]),
+                reply["content"],
+                reply["variant"],
+            )
+
     def _build_context(self, user_message: str) -> str:
         """Build a prompt that includes recent conversation history."""
         if not self.conversation_history:
@@ -408,6 +463,38 @@ class ChatSession:
             f"[Previous conversation for context]\n{history_str}\n\n"
             f"[Latest message from the user]\n{user_message}"
         )
+
+
+async def _generate_and_send_audio(
+    websocket: WebSocket,
+    text: str,
+    voice: str,
+    agent_id: str,
+    variant_name: str,
+):
+    """Background task: generate TTS audio and send it over WebSocket.
+    Also triggers MuseTalk video if enabled."""
+    try:
+        audio_bytes = await generate_tts(text, voice)
+        if audio_bytes:
+            audio_b64 = base64.b64encode(audio_bytes).decode("utf-8")
+            await websocket.send_json({
+                "type": "agent_audio",
+                "agent_id": agent_id,
+                "variant": variant_name,
+                "audio": audio_b64,
+                "format": "mp3",
+            })
+
+            # Fire off MuseTalk video generation in background
+            if MUSETALK_ENABLED:
+                asyncio.create_task(
+                    _generate_and_send_video(
+                        websocket, agent_id, variant_name, audio_bytes
+                    )
+                )
+    except Exception as e:
+        logger.warning(f"TTS/audio failed for {agent_id}: {e}")
 
 
 async def _generate_and_send_video(
@@ -895,8 +982,11 @@ async def websocket_chat(websocket: WebSocket):
         await websocket.close()
         return
 
-    # Create a fresh session for this connection
-    session = ChatSession(agent_configs)
+    # Parse optional user_name from query params
+    user_name = websocket.query_params.get("user", "")
+
+    # Create a fresh session for this connection (with persistent memory)
+    session = ChatSession(agent_configs, user_name=user_name)
 
     # Send confirmation with agent list
     await websocket.send_json({

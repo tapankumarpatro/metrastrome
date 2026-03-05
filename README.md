@@ -27,7 +27,7 @@ You join a virtual meeting room, pick your team of AI agents, type or speak your
 
 ---
 
-## The Agents
+## For this example here are my variants
 
 | Emoji | Variant | Expertise | Backstory |
 |:-----:|---------|-----------|-----------|

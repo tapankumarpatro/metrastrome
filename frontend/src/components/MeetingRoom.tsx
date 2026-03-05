@@ -44,6 +44,12 @@ export function MeetingRoom({
   const chatInputRef = useRef<HTMLInputElement>(null);
   const msgIdRef = useRef(0);
 
+  // ── Audio playback state (declared early so speech recognition can reference it) ──
+  const audioQueueRef = useRef<Array<{ audioB64: string; agentId: string }>>([]);
+  const isPlayingRef = useRef(false);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const [playingAgentId, setPlayingAgentId] = useState<string | null>(null);
+
   // ── Speech Recognition: mic → transcript → WebSocket ──
   const sendVoiceTranscript = useCallback((transcript: string) => {
     if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
@@ -56,16 +62,13 @@ export function MeetingRoom({
     setIsThinking(true);
   }, []);
 
+  const isAudioPlaying = playingAgentId !== null;
+
   const { isListening, isSupported: sttSupported } = useSpeechRecognition({
     onTranscript: sendVoiceTranscript,
     enabled: !isMuted && isConnected,
+    pauseWhilePlaying: isAudioPlaying,
   });
-
-  // ── Audio playback queue (edge-tts MP3 from backend) ──
-  const audioQueueRef = useRef<Array<{ audioB64: string; agentId: string }>>([]);
-  const isPlayingRef = useRef(false);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const [playingAgentId, setPlayingAgentId] = useState<string | null>(null);
 
   const playNextInQueue = useCallback(() => {
     if (isPlayingRef.current || audioQueueRef.current.length === 0) return;
@@ -131,7 +134,8 @@ export function MeetingRoom({
   // WebSocket connection
   useEffect(() => {
     const agentIds = enabledAgents.map((a) => a.id).join(",");
-    const url = `${wsUrl}/ws/chat?agents=${agentIds}`;
+    const userName = encodeURIComponent(identity);
+    const url = `${wsUrl}/ws/chat?agents=${agentIds}&user=${userName}`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
