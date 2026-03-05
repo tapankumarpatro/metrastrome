@@ -38,7 +38,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
 
   // ── About Me state ──
-  const [profile, setProfile] = useState<UserProfile>({ name: "", bio: "", expertise: "", photo: "" });
+  const [profile, setProfile] = useState<UserProfile>({ name: "", bio: "", expertise: "", photo: "", videoMode: false });
   const [profileSaved, setProfileSaved] = useState(false);
 
   // "I want to talk to" form state
@@ -379,6 +379,37 @@ export default function SettingsPage() {
                     <span className="text-xs text-slate-400">JPG or PNG, max 5 MB</span>
                   )}
                 </div>
+              </div>
+
+              {/* Video Mode Toggle */}
+              <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-4">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <label className="block text-xs font-medium text-slate-700">
+                      Video Avatars (MuseTalk)
+                    </label>
+                    <p className="mt-0.5 text-[11px] text-slate-400">
+                      Enable lip-synced video avatars during meetings. Requires a GPU on the server.
+                    </p>
+                  </div>
+                  <button
+                    onClick={() => setProfile((prev) => ({ ...prev, videoMode: !prev.videoMode }))}
+                    className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
+                      profile.videoMode ? "bg-emerald-500" : "bg-slate-300"
+                    }`}
+                  >
+                    <span
+                      className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
+                        profile.videoMode ? "translate-x-5" : "translate-x-0"
+                      }`}
+                    />
+                  </button>
+                </div>
+                {profile.videoMode && (
+                  <p className="mt-2 text-[11px] text-amber-600 font-medium">
+                    ⚠ Video mode needs MuseTalk running on port 8001 with a compatible GPU. Without it, meetings will use CSS animations.
+                  </p>
+                )}
               </div>
 
               <button

@@ -113,6 +113,83 @@ async def delete_user_photo():
 
 # ── Conversation history endpoints ────────────────────────────────────
 
+class AsyncChatRequest(BaseModel):
+    agent_id: str
+    message: str
+    user_name: str = ""
+
+@app.post("/chat/agent")
+async def async_chat_with_agent(req: AsyncChatRequest):
+    """Send a single message to a specific agent and get a reply (non-realtime).
+    Used for the social feed / 1-on-1 chat outside meetings."""
+    if not OPENROUTER_API_KEY:
+        return {"error": "OPENROUTER_API_KEY not set"}
+
+    agent_cfg = agent_module.AGENT_REGISTRY.get(req.agent_id)
+    if not agent_cfg:
+        return {"error": f"Unknown agent: {req.agent_id}"}
+
+    # Build context from past conversations with this agent
+    past_context = convstore.get_conversation_context_for_agent(req.agent_id, max_messages=15)
+    user_name = req.user_name or "User"
+
+    system_msg = agent_cfg.system_prompt
+    if past_context:
+        system_msg += (
+            f"\n\nThe user's name is {user_name}."
+            "\n\nYou have memories from past conversations. Use them naturally."
+            f"\n\n{past_context}"
+        )
+    else:
+        system_msg += f"\n\nThe user's name is {user_name}."
+
+    system_msg += (
+        "\n\nThis is a casual 1-on-1 chat outside of a brainstorming meeting. "
+        "Be conversational, warm, and concise. You can ask follow-up questions, "
+        "share your perspective, or bring up interesting topics from past discussions."
+    )
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": OPENROUTER_MODEL,
+                    "messages": [
+                        {"role": "system", "content": system_msg},
+                        {"role": "user", "content": req.message},
+                    ],
+                    "temperature": 0.8,
+                    "max_tokens": 500,
+                },
+                timeout=aiohttp.ClientTimeout(total=60),
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    return {"error": f"LLM error: {resp.status}"}
+                data = await resp.json()
+                reply = data["choices"][0]["message"]["content"]
+
+        # Persist the exchange
+        chat_session_id = f"dm-{req.agent_id}-{int(asyncio.get_event_loop().time())}"
+        convstore.create_session(chat_session_id, [req.agent_id], user_name)
+        convstore.add_message(chat_session_id, "user", req.message, user_name)
+        convstore.add_message(chat_session_id, req.agent_id, reply, agent_cfg.variant)
+
+        return {
+            "agent_id": req.agent_id,
+            "variant": agent_cfg.variant,
+            "reply": reply,
+        }
+    except Exception as e:
+        logger.error(f"Async chat error: {e}")
+        return {"error": str(e)}
+
+
 @app.get("/conversations")
 async def list_conversations(limit: int = 20):
     """List recent conversation sessions."""
@@ -278,11 +355,12 @@ class ChatSession:
 
     MAX_AGENT_REPLIES_PER_TURN = 3  # At most 3 agents speak per user message
 
-    def __init__(self, agent_configs: list[AgentConfig], user_name: str = ""):
+    def __init__(self, agent_configs: list[AgentConfig], user_name: str = "", enable_video: bool = False):
         self.model_client = build_model_client()
         self.agent_configs = agent_configs
         self.conversation_history: list[dict] = []  # manual context window
         self.user_name = user_name
+        self.enable_video = enable_video
 
         # Create a persistent session
         import uuid
@@ -418,7 +496,8 @@ class ChatSession:
                 voice = agent_cfg.voice if agent_cfg else "en-US-AndrewMultilingualNeural"
                 asyncio.create_task(
                     _generate_and_send_audio(
-                        websocket, content, voice, agent_id, variant_name
+                        websocket, content, voice, agent_id, variant_name,
+                        enable_video=self.enable_video
                     )
                 )
 
@@ -471,9 +550,10 @@ async def _generate_and_send_audio(
     voice: str,
     agent_id: str,
     variant_name: str,
+    enable_video: bool = False,
 ):
     """Background task: generate TTS audio and send it over WebSocket.
-    Also triggers MuseTalk video if enabled."""
+    Also triggers MuseTalk video if enable_video is True."""
     try:
         audio_bytes = await generate_tts(text, voice)
         if audio_bytes:
@@ -486,8 +566,8 @@ async def _generate_and_send_audio(
                 "format": "mp3",
             })
 
-            # Fire off MuseTalk video generation in background
-            if MUSETALK_ENABLED:
+            # Fire off MuseTalk video generation if user enabled video mode
+            if enable_video:
                 asyncio.create_task(
                     _generate_and_send_video(
                         websocket, agent_id, variant_name, audio_bytes
@@ -982,11 +1062,12 @@ async def websocket_chat(websocket: WebSocket):
         await websocket.close()
         return
 
-    # Parse optional user_name from query params
+    # Parse optional params from query string
     user_name = websocket.query_params.get("user", "")
+    video_requested = websocket.query_params.get("video", "0") == "1"
 
     # Create a fresh session for this connection (with persistent memory)
-    session = ChatSession(agent_configs, user_name=user_name)
+    session = ChatSession(agent_configs, user_name=user_name, enable_video=video_requested and MUSETALK_ENABLED)
 
     # Send confirmation with agent list
     await websocket.send_json({

@@ -5,6 +5,7 @@ import { ParticipantTile } from "./ParticipantTile";
 import { MeetingControls } from "./MeetingControls";
 import { useSpeechRecognition } from "@/hooks/useSpeechRecognition";
 import type { AgentInfo } from "@/lib/agents";
+import { getProfile } from "@/lib/profile";
 
 export interface MeetingRoomProps {
   wsUrl: string;
@@ -135,7 +136,8 @@ export function MeetingRoom({
   useEffect(() => {
     const agentIds = enabledAgents.map((a) => a.id).join(",");
     const userName = encodeURIComponent(identity);
-    const url = `${wsUrl}/ws/chat?agents=${agentIds}&user=${userName}`;
+    const videoMode = getProfile().videoMode ? "1" : "0";
+    const url = `${wsUrl}/ws/chat?agents=${agentIds}&user=${userName}&video=${videoMode}`;
     const ws = new WebSocket(url);
     wsRef.current = ws;
 
