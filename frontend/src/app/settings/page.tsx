@@ -575,7 +575,7 @@ export default function SettingsPage() {
                       <div className="mb-3">
                         <label className="mb-1 block text-xs font-medium text-slate-500">Generated Portrait</label>
                         <img
-                          src={generated.image.startsWith("http") ? generated.image : `${API_URL}${generated.image}`}
+                          src={generated.image}
                           alt={generated.variant}
                           className="h-40 w-40 rounded-xl object-cover border border-slate-200 shadow-sm"
                         />

@@ -1032,6 +1032,8 @@ async def generate_agent_config(req: GenerateAgentRequest):
             })
 
             # ── Step 2: Generate image via Nano Banana 2 ──
+            # Clear any LLM-generated image field (it's supposed to be empty)
+            agent_config["image"] = ""
             image_prompt = agent_config.get("image_prompt", "")
             agent_id = agent_config.get("id", "unknown-agent")
 
@@ -1080,7 +1082,7 @@ async def generate_agent_config(req: GenerateAgentRequest):
 
                 filename = image_task.result()
                 if filename:
-                    agent_config["image"] = filename
+                    agent_config["image"] = f"/images/{filename}"
                     logger.info(f"Agent {agent_id} portrait: {filename}")
                     yield _sse_event("progress", {
                         "step": "image_done",
