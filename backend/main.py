@@ -402,13 +402,13 @@ class ChatSession:
             user_clause = f"\n\nThe user's name is {self.user_name}. Address them by name occasionally."
 
         for cfg in self.agent_configs:
-            # Retrieve persistent notes for this agent from ChromaDB
+            # Retrieve from this agent's PERSONAL notes collection
             notes_ctx = memstore.build_agent_notes_context(cfg.identity)
 
-            # Retrieve recent relevant memories from ChromaDB vector store
-            memory_ctx = memstore.build_memory_context(
-                query=f"conversations with {self.user_name or 'user'}",
+            # Retrieve from this agent's PERSONAL vector store (per-agent RAG)
+            memory_ctx = memstore.build_agent_memory_context(
                 agent_id=cfg.identity,
+                query=f"conversations with {self.user_name or 'user'}",
                 n_results=8,
             )
 
@@ -748,6 +748,16 @@ enabled_agent_ids: list[str] = []
 @app.get("/health")
 async def health():
     return {"status": "ok", "agents": enabled_agent_ids}
+
+
+@app.get("/memory/stats")
+async def memory_stats():
+    """Show per-agent vector memory stats."""
+    all_stats = memstore.get_all_memory_stats()
+    agent_stats = []
+    for aid in enabled_agent_ids:
+        agent_stats.append(memstore.get_agent_memory_stats(aid))
+    return {"global": all_stats, "agents": agent_stats}
 
 
 @app.get("/agents")

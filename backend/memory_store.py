@@ -1,11 +1,16 @@
 """
-Vector-based conversation memory using ChromaDB.
+Per-agent vector memory using ChromaDB.
 
-Stores conversation exchanges as embeddings for semantic retrieval.
-Each exchange (user message + agent reply) is stored as a single document.
-Retrieval finds the most relevant past exchanges given a new query.
+Each agent gets its OWN ChromaDB collection — true per-agent RAG.
+When an agent is about to speak, we retrieve semantically relevant
+past conversations from THAT agent's personal memory store.
 
-Also manages agent-level summaries (notes) that persist across sessions.
+Architecture:
+  - Collection per agent: "agent_{agent_id}" (e.g. "agent_tapan-strategist")
+  - Collection for notes: "notes_{agent_id}"
+  - Global collection: "conversations" (cross-agent search)
+
+Each document = one user↔agent exchange, embedded for cosine similarity.
 """
 
 import json
@@ -35,20 +40,40 @@ def _get_client() -> chromadb.ClientAPI:
     return _client
 
 
-def _get_collection(name: str = "conversations"):
-    """Get or create a ChromaDB collection."""
+def _sanitize_collection_name(name: str) -> str:
+    """ChromaDB collection names must be 3-63 chars, alphanumeric + underscores/hyphens."""
+    import re
+    clean = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    # Must start/end with alphanumeric
+    clean = clean.strip("_-") or "default"
+    return clean[:63]
+
+
+def _get_agent_collection(agent_id: str):
+    """Get or create this agent's PERSONAL vector store."""
     client = _get_client()
+    name = _sanitize_collection_name(f"agent_{agent_id}")
     return client.get_or_create_collection(
         name=name,
         metadata={"hnsw:space": "cosine"},
     )
 
 
-def _get_notes_collection():
-    """Collection for agent-level persistent notes/summaries."""
+def _get_agent_notes_collection(agent_id: str):
+    """Get or create this agent's PERSONAL notes collection."""
+    client = _get_client()
+    name = _sanitize_collection_name(f"notes_{agent_id}")
+    return client.get_or_create_collection(
+        name=name,
+        metadata={"hnsw:space": "cosine"},
+    )
+
+
+def _get_global_collection():
+    """Global collection for cross-agent search (e.g. _build_context)."""
     client = _get_client()
     return client.get_or_create_collection(
-        name="agent_notes",
+        name="conversations",
         metadata={"hnsw:space": "cosine"},
     )
 
@@ -63,33 +88,34 @@ def store_exchange(
     agent_reply: str,
     user_name: str = "",
 ):
-    """Store a single user→agent exchange as an embeddable document.
-    The document text is the combined exchange for semantic matching."""
-    collection = _get_collection()
-
-    # Build a searchable document from the exchange
+    """Store a user↔agent exchange in BOTH the agent's personal collection
+    AND the global collection."""
     doc_text = f"User ({user_name or 'User'}): {user_message}\n{agent_variant}: {agent_reply}"
-    doc_id = f"{session_id}_{agent_id}_{int(time.time() * 1000)}"
+    ts = time.time()
+    doc_id = f"{session_id}_{agent_id}_{int(ts * 1000)}"
 
     metadata = {
         "session_id": session_id,
         "agent_id": agent_id,
         "agent_variant": agent_variant,
         "user_name": user_name,
-        "timestamp": time.time(),
-        "user_message": user_message[:500],  # truncate for metadata
+        "timestamp": ts,
+        "user_message": user_message[:500],
         "agent_reply": agent_reply[:500],
     }
 
     try:
-        collection.add(
-            documents=[doc_text],
-            metadatas=[metadata],
-            ids=[doc_id],
-        )
-        logger.debug(f"[Memory] Stored exchange: {agent_variant} ({len(doc_text)} chars)")
+        # Store in agent's personal collection
+        agent_col = _get_agent_collection(agent_id)
+        agent_col.add(documents=[doc_text], metadatas=[metadata], ids=[doc_id])
+
+        # Also store in global collection for cross-agent retrieval
+        global_col = _get_global_collection()
+        global_col.add(documents=[doc_text], metadatas=[metadata], ids=[f"g_{doc_id}"])
+
+        logger.debug(f"[Memory] Stored exchange in agent_{agent_id} + global ({len(doc_text)} chars)")
     except Exception as e:
-        logger.error(f"[Memory] Failed to store exchange: {e}")
+        logger.error(f"[Memory] Failed to store exchange for {agent_id}: {e}")
 
 
 def store_group_round(
@@ -98,8 +124,8 @@ def store_group_round(
     agent_replies: list[dict],
     user_name: str = "",
 ):
-    """Store all exchanges from a single conversation round.
-    Each agent reply becomes a separate document for targeted retrieval."""
+    """Store all exchanges from a conversation round — each goes to the
+    respective agent's personal collection + global."""
     for reply in agent_replies:
         store_exchange(
             session_id=session_id,
@@ -111,54 +137,20 @@ def store_group_round(
         )
 
 
-# ── Retrieve relevant memories ───────────────────────────────────────
+# ── Retrieve from an agent's personal memory ─────────────────────────
 
-def retrieve_memories(
-    query: str,
-    agent_id: str = "",
-    n_results: int = 5,
-    max_age_hours: float = 0,
-) -> list[dict]:
-    """Retrieve the most relevant past exchanges for a given query.
-    
-    Args:
-        query: The current user message or topic to match against.
-        agent_id: If provided, only retrieve memories involving this agent.
-        n_results: Max number of results to return.
-        max_age_hours: If > 0, only retrieve memories newer than this.
-    
-    Returns:
-        List of dicts with keys: document, user_message, agent_reply, 
-        agent_variant, timestamp, distance.
-    """
-    collection = _get_collection()
-
-    # Check if collection has any documents
+def _query_collection(collection, query: str, n_results: int = 5) -> list[dict]:
+    """Run a semantic query against any ChromaDB collection."""
     if collection.count() == 0:
         return []
-
-    # Build where clause for filtering
-    where = None
-    where_clauses = []
-    if agent_id:
-        where_clauses.append({"agent_id": agent_id})
-    if max_age_hours > 0:
-        cutoff = time.time() - (max_age_hours * 3600)
-        where_clauses.append({"timestamp": {"$gte": cutoff}})
-    
-    if len(where_clauses) == 1:
-        where = where_clauses[0]
-    elif len(where_clauses) > 1:
-        where = {"$and": where_clauses}
 
     try:
         results = collection.query(
             query_texts=[query],
             n_results=min(n_results, collection.count()),
-            where=where if where else None,
         )
     except Exception as e:
-        logger.error(f"[Memory] Retrieval failed: {e}")
+        logger.error(f"[Memory] Query failed: {e}")
         return []
 
     memories = []
@@ -175,121 +167,172 @@ def retrieve_memories(
                 "timestamp": meta.get("timestamp", 0),
                 "distance": dist,
             })
-
     return memories
 
 
-def build_memory_context(
-    query: str,
-    agent_id: str = "",
-    n_results: int = 5,
-) -> str:
-    """Build a formatted context string from retrieved memories.
-    Ready to inject into an agent's system prompt or conversation context."""
+def retrieve_agent_memories(agent_id: str, query: str, n_results: int = 5) -> list[dict]:
+    """Retrieve from this agent's PERSONAL vector store."""
+    col = _get_agent_collection(agent_id)
+    return _query_collection(col, query, n_results)
+
+
+def retrieve_global_memories(query: str, n_results: int = 5) -> list[dict]:
+    """Retrieve from the GLOBAL collection (all agents)."""
+    col = _get_global_collection()
+    return _query_collection(col, query, n_results)
+
+
+def retrieve_memories(query: str, agent_id: str = "", n_results: int = 5, **kwargs) -> list[dict]:
+    """Backward-compatible retrieval. Uses agent's personal store if agent_id provided,
+    otherwise falls back to global."""
+    if agent_id:
+        return retrieve_agent_memories(agent_id, query, n_results)
+    return retrieve_global_memories(query, n_results)
+
+
+def _format_age(timestamp: float) -> str:
+    """Format a timestamp as relative age string."""
+    if not timestamp:
+        return "unknown"
+    age_hours = (time.time() - timestamp) / 3600
+    if age_hours < 1:
+        return f"{int(age_hours * 60)}m ago"
+    elif age_hours < 24:
+        return f"{int(age_hours)}h ago"
+    return f"{int(age_hours / 24)}d ago"
+
+
+def build_memory_context(query: str, agent_id: str = "", n_results: int = 5) -> str:
+    """Build formatted context from an agent's personal memories.
+    If agent_id is provided, searches that agent's personal collection.
+    Otherwise searches the global collection."""
     memories = retrieve_memories(query=query, agent_id=agent_id, n_results=n_results)
-    
+
     if not memories:
         return ""
 
-    lines = ["[RELEVANT MEMORIES FROM PAST CONVERSATIONS]"]
+    lines = [f"[RELEVANT MEMORIES FROM YOUR PAST CONVERSATIONS]"]
     for i, mem in enumerate(memories, 1):
-        # Format timestamp as relative time
-        age_hours = (time.time() - mem["timestamp"]) / 3600 if mem["timestamp"] else 0
-        if age_hours < 1:
-            age_str = f"{int(age_hours * 60)}m ago"
-        elif age_hours < 24:
-            age_str = f"{int(age_hours)}h ago"
-        else:
-            age_str = f"{int(age_hours / 24)}d ago"
-
-        lines.append(f"\n--- Memory {i} ({age_str}) ---")
+        lines.append(f"\n--- Memory {i} ({_format_age(mem['timestamp'])}) ---")
         lines.append(mem["document"])
 
     return "\n".join(lines)
 
 
-# ── Agent Notes (persistent summaries) ───────────────────────────────
+def build_agent_memory_context(agent_id: str, query: str, n_results: int = 5) -> str:
+    """Build RAG context specifically from this agent's personal vector store.
+    This is the primary function for per-agent RAG injection."""
+    memories = retrieve_agent_memories(agent_id, query, n_results)
+
+    if not memories:
+        return ""
+
+    lines = [f"[YOUR PERSONAL MEMORIES (from your past conversations)]"]
+    for i, mem in enumerate(memories, 1):
+        lines.append(f"\n--- Memory {i} ({_format_age(mem['timestamp'])}) ---")
+        lines.append(mem["document"])
+
+    return "\n".join(lines)
+
+
+# ── Agent Notes (persistent per-agent summaries) ─────────────────────
 
 def store_agent_note(agent_id: str, agent_variant: str, note: str):
-    """Store a persistent note/summary for an agent about the user."""
-    collection = _get_notes_collection()
-    doc_id = f"note_{agent_id}_{int(time.time() * 1000)}"
+    """Store a note in this agent's PERSONAL notes collection."""
+    col = _get_agent_notes_collection(agent_id)
+    doc_id = f"note_{int(time.time() * 1000)}"
 
     try:
-        collection.add(
+        col.add(
             documents=[note],
             metadatas=[{
                 "agent_id": agent_id,
                 "agent_variant": agent_variant,
                 "timestamp": time.time(),
-                "type": "agent_note",
             }],
             ids=[doc_id],
         )
         logger.info(f"[Memory] Stored note for {agent_variant}: {note[:80]}...")
     except Exception as e:
-        logger.error(f"[Memory] Failed to store note: {e}")
+        logger.error(f"[Memory] Failed to store note for {agent_id}: {e}")
 
 
-def get_agent_notes(agent_id: str, n_results: int = 5) -> list[str]:
-    """Retrieve persistent notes for an agent."""
-    collection = _get_notes_collection()
-    
-    if collection.count() == 0:
+def get_agent_notes(agent_id: str, n_results: int = 10) -> list[str]:
+    """Retrieve all notes from this agent's personal notes collection."""
+    col = _get_agent_notes_collection(agent_id)
+
+    if col.count() == 0:
         return []
 
     try:
-        results = collection.get(
-            where={"agent_id": agent_id},
-            limit=n_results,
-        )
+        results = col.get(limit=n_results)
     except Exception as e:
-        logger.error(f"[Memory] Failed to get notes: {e}")
+        logger.error(f"[Memory] Failed to get notes for {agent_id}: {e}")
         return []
 
-    if results and results["documents"]:
-        return results["documents"]
-    return []
+    return results["documents"] if results and results["documents"] else []
 
 
 def build_agent_notes_context(agent_id: str) -> str:
-    """Build a formatted string of agent notes for prompt injection."""
+    """Build formatted string of this agent's personal notes."""
     notes = get_agent_notes(agent_id)
     if not notes:
         return ""
-    
+
     lines = ["[YOUR PERSISTENT NOTES ABOUT THIS USER]"]
     for note in notes:
         lines.append(f"- {note}")
     return "\n".join(lines)
 
 
-# ── Backfill existing SQLite data into ChromaDB ─────────────────────
+# ── Stats / debug ────────────────────────────────────────────────────
+
+def get_agent_memory_stats(agent_id: str) -> dict:
+    """Get memory stats for a specific agent."""
+    mem_col = _get_agent_collection(agent_id)
+    notes_col = _get_agent_notes_collection(agent_id)
+    return {
+        "agent_id": agent_id,
+        "exchanges": mem_col.count(),
+        "notes": notes_col.count(),
+    }
+
+
+def get_all_memory_stats() -> dict:
+    """Get stats across all collections."""
+    client = _get_client()
+    collections = client.list_collections()
+    global_col = _get_global_collection()
+    return {
+        "total_collections": len(collections),
+        "global_exchanges": global_col.count(),
+        "collections": [c.name for c in collections],
+    }
+
+
+# ── Backfill existing SQLite data into per-agent ChromaDB ────────────
 
 def backfill_from_sqlite():
-    """One-time migration: load existing SQLite messages into ChromaDB."""
+    """One-time migration: load existing SQLite messages into per-agent ChromaDB."""
     try:
         import conversation_store as cs
         conn = cs._get_conn()
-        
-        # Get all sessions
+
         sessions = conn.execute(
             "SELECT id, user_name, agents FROM sessions ORDER BY created_at ASC"
         ).fetchall()
-        
+
         total_stored = 0
         for session in sessions:
             session_id = session[0]
             user_name = session[1] or "User"
-            
-            # Get messages for this session
+
             messages = conn.execute(
                 "SELECT role, variant, content, timestamp FROM messages "
                 "WHERE session_id = ? ORDER BY timestamp ASC",
                 (session_id,),
             ).fetchall()
-            
-            # Pair user messages with agent replies
+
             current_user_msg = None
             for msg in messages:
                 role, variant, content, ts = msg[0], msg[1], msg[2], msg[3]
@@ -305,8 +348,8 @@ def backfill_from_sqlite():
                         user_name=user_name,
                     )
                     total_stored += 1
-        
-        logger.info(f"[Memory] Backfilled {total_stored} exchanges from SQLite to ChromaDB")
+
+        logger.info(f"[Memory] Backfilled {total_stored} exchanges into per-agent ChromaDB")
         return total_stored
     except Exception as e:
         logger.error(f"[Memory] Backfill failed: {e}")
