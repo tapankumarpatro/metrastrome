@@ -402,21 +402,27 @@ class ChatSession:
             user_clause = f"\n\nThe user's name is {self.user_name}. Address them by name occasionally."
 
         for cfg in self.agent_configs:
-            # Retrieve from this agent's PERSONAL notes collection
+            # 1. Agent's personal notes
             notes_ctx = memstore.build_agent_notes_context(cfg.identity)
 
-            # Retrieve from this agent's PERSONAL vector store (per-agent RAG)
-            memory_ctx = memstore.build_agent_memory_context(
+            # 2. PERSONAL MEMORY — role-specific topics routed to this agent's expertise
+            personal_ctx = memstore.build_agent_memory_context(
                 agent_id=cfg.identity,
                 query=f"conversations with {self.user_name or 'user'}",
-                n_results=8,
+                n_results=5,
+            )
+
+            # 3. SHARED MEMORY — full raw conversation history (all agents)
+            shared_ctx = memstore.build_shared_memory_context(
+                query=f"conversations with {self.user_name or 'user'}",
+                n_results=5,
             )
 
             memory_section = ""
-            if notes_ctx or memory_ctx:
-                parts = [p for p in [notes_ctx, memory_ctx] if p]
+            parts = [p for p in [notes_ctx, personal_ctx, shared_ctx] if p]
+            if parts:
                 memory_section = "\n\n" + "\n\n".join(parts)
-                logger.info(f"Injected {len(memory_section)} chars of vector memory for {cfg.identity}")
+                logger.info(f"Injected {len(memory_section)} chars of dual-layer memory for {cfg.identity}")
 
             system_msg = (
                 cfg.system_prompt
@@ -656,16 +662,16 @@ class ChatSession:
                 logger.error(f"[Memory] Failed to generate note for {variant}: {e}")
 
     def _build_context(self, user_message: str) -> str:
-        """Build a prompt that includes recent conversation history + vector-retrieved memories."""
+        """Build a prompt that includes recent conversation history + dual-layer vector memories."""
         parts = []
 
-        # Retrieve relevant memories from ChromaDB based on the current message
-        memory_ctx = memstore.build_memory_context(
+        # SHARED MEMORY — full raw conversation context from all agents
+        shared_ctx = memstore.build_shared_memory_context(
             query=user_message,
             n_results=3,
         )
-        if memory_ctx:
-            parts.append(memory_ctx)
+        if shared_ctx:
+            parts.append(shared_ctx)
 
         # Add recent in-session conversation history
         if self.conversation_history:
@@ -1157,6 +1163,8 @@ async def add_agent(req: AddAgentRequest):
         json.dump(config, f, indent=2, ensure_ascii=False)
 
     reload_agents()
+    # Reload topic router with updated agent list
+    memstore.load_agent_topics(config["agents"])
     logger.info(f"Added agent: {req.id} ({req.variant})")
     return {"ok": True, "id": req.id, "total_agents": len(agent_module.AGENT_REGISTRY)}
 
@@ -1178,6 +1186,8 @@ async def delete_agent(agent_id: str):
         json.dump(config, f, indent=2, ensure_ascii=False)
 
     reload_agents()
+    # Reload topic router with updated agent list
+    memstore.load_agent_topics(config["agents"])
     logger.info(f"Removed agent: {agent_id}")
     return {"ok": True, "id": agent_id, "total_agents": len(agent_module.AGENT_REGISTRY)}
 
@@ -1298,6 +1308,15 @@ def main():
         f"{', '.join(enabled_agent_ids)}"
     )
     logger.info(f"Model: {OPENROUTER_MODEL}")
+
+    # Load topic router for dual-layer memory (expertise-based routing)
+    try:
+        config_path = get_config_path()
+        with open(config_path, "r", encoding="utf-8") as f:
+            raw_config = json.load(f)
+        memstore.load_agent_topics(raw_config.get("agents", []))
+    except Exception as e:
+        logger.warning(f"Topic router init skipped: {e}")
 
     # Backfill existing SQLite conversations into ChromaDB vector store
     try:

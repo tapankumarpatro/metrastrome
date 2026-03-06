@@ -1,19 +1,30 @@
 """
-Per-agent vector memory using ChromaDB.
+Dual-layer vector memory using ChromaDB.
 
-Each agent gets its OWN ChromaDB collection — true per-agent RAG.
-When an agent is about to speak, we retrieve semantically relevant
-past conversations from THAT agent's personal memory store.
+Two memory tiers:
+  1. SHARED MEMORY (global "conversations" collection)
+     - ALL raw conversations stored here — every user↔agent exchange
+     - Every agent can search this for full conversation context
 
-Architecture:
-  - Collection per agent: "agent_{agent_id}" (e.g. "agent_tapan-strategist")
-  - Collection for notes: "notes_{agent_id}"
-  - Global collection: "conversations" (cross-agent search)
+  2. PERSONAL MEMORY (per-agent "agent_{id}" collections)
+     - Topic-routed: exchanges are analyzed and routed to agents whose
+       EXPERTISE matches the conversation topic
+     - E.g. design talk → The Artist's personal memory
+            system architecture → The Architect's personal memory
+     - The speaking agent ALWAYS gets the exchange in their personal memory
+     - Other agents whose expertise matches ALSO get a copy
 
-Each document = one user↔agent exchange, embedded for cosine similarity.
+  3. PERSONAL NOTES (per-agent "notes_{id}" collections)
+     - LLM-generated summaries about the user, per agent
+
+This means an agent's system prompt gets:
+  - Their personal role-specific memories (design convos for Artist, etc.)
+  - Shared global context (full raw conversation history)
+  - Their personal notes about the user
 """
 
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional
@@ -42,15 +53,13 @@ def _get_client() -> chromadb.ClientAPI:
 
 def _sanitize_collection_name(name: str) -> str:
     """ChromaDB collection names must be 3-63 chars, alphanumeric + underscores/hyphens."""
-    import re
     clean = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
-    # Must start/end with alphanumeric
     clean = clean.strip("_-") or "default"
     return clean[:63]
 
 
 def _get_agent_collection(agent_id: str):
-    """Get or create this agent's PERSONAL vector store."""
+    """Get or create this agent's PERSONAL (role-based) vector store."""
     client = _get_client()
     name = _sanitize_collection_name(f"agent_{agent_id}")
     return client.get_or_create_collection(
@@ -70,12 +79,96 @@ def _get_agent_notes_collection(agent_id: str):
 
 
 def _get_global_collection():
-    """Global collection for cross-agent search (e.g. _build_context)."""
+    """SHARED MEMORY: stores ALL raw conversations — every agent can access."""
     client = _get_client()
     return client.get_or_create_collection(
         name="conversations",
         metadata={"hnsw:space": "cosine"},
     )
+
+
+# ── Topic Router: match exchange content to agent expertise ──────────
+
+# Maps agent_id → set of lowercase keywords from their expertise + description
+_agent_topic_map: dict[str, set[str]] = {}
+
+
+def load_agent_topics(agents_config: list[dict]):
+    """Load agent expertise keywords from agents.config.json data.
+    Called once at startup from main.py after loading agent configs."""
+    global _agent_topic_map
+    _agent_topic_map.clear()
+
+    for agent in agents_config:
+        agent_id = agent.get("id", "")
+        if not agent_id:
+            continue
+
+        keywords = set()
+        # Add all expertise items (lowercased, split multi-word into individual words too)
+        for exp in agent.get("expertise", []):
+            keywords.add(exp.lower())
+            for word in exp.lower().split():
+                if len(word) > 3:  # skip tiny words like "and", "for"
+                    keywords.add(word)
+
+        # Add key terms from description
+        desc = agent.get("description", "").lower()
+        for word in desc.split():
+            clean = re.sub(r"[^a-z0-9]", "", word)
+            if len(clean) > 4:  # only meaningful words
+                keywords.add(clean)
+
+        # Add personality keywords
+        personality = agent.get("personality", "").lower()
+        for word in personality.split(","):
+            clean = word.strip()
+            if clean:
+                keywords.add(clean)
+
+        # Add technologies from projects
+        for proj in agent.get("projects", []):
+            for tech in proj.get("technologies", []):
+                keywords.add(tech.lower())
+                for word in tech.lower().split():
+                    if len(word) > 3:
+                        keywords.add(word)
+
+        _agent_topic_map[agent_id] = keywords
+        logger.debug(f"[TopicRouter] {agent_id}: {len(keywords)} keywords")
+
+    logger.info(f"[TopicRouter] Loaded topic maps for {len(_agent_topic_map)} agents")
+
+
+def _route_to_agents(text: str, speaking_agent_id: str = "") -> list[str]:
+    """Determine which agents' personal memories should receive this exchange.
+    Returns list of agent_ids. The speaking agent ALWAYS gets it.
+    Other agents get it if ≥2 of their expertise keywords appear in the text."""
+    if not _agent_topic_map:
+        # Fallback: just the speaking agent
+        return [speaking_agent_id] if speaking_agent_id else []
+
+    text_lower = text.lower()
+    routed = set()
+
+    # Speaking agent always gets their own exchange
+    if speaking_agent_id:
+        routed.add(speaking_agent_id)
+
+    # Score each agent by keyword matches
+    for agent_id, keywords in _agent_topic_map.items():
+        if agent_id == speaking_agent_id:
+            continue  # already included
+
+        match_count = 0
+        for kw in keywords:
+            if kw in text_lower:
+                match_count += 1
+                if match_count >= 2:  # threshold: at least 2 keyword matches
+                    routed.add(agent_id)
+                    break
+
+    return list(routed)
 
 
 # ── Store conversation exchanges ─────────────────────────────────────
@@ -88,11 +181,13 @@ def store_exchange(
     agent_reply: str,
     user_name: str = "",
 ):
-    """Store a user↔agent exchange in BOTH the agent's personal collection
-    AND the global collection."""
+    """Store an exchange in:
+    1. SHARED MEMORY (global) — always, raw content
+    2. PERSONAL MEMORY — speaking agent + any agents whose expertise matches the topic
+    """
     doc_text = f"User ({user_name or 'User'}): {user_message}\n{agent_variant}: {agent_reply}"
     ts = time.time()
-    doc_id = f"{session_id}_{agent_id}_{int(ts * 1000)}"
+    base_id = f"{session_id}_{agent_id}_{int(ts * 1000)}"
 
     metadata = {
         "session_id": session_id,
@@ -105,15 +200,23 @@ def store_exchange(
     }
 
     try:
-        # Store in agent's personal collection
-        agent_col = _get_agent_collection(agent_id)
-        agent_col.add(documents=[doc_text], metadatas=[metadata], ids=[doc_id])
-
-        # Also store in global collection for cross-agent retrieval
+        # 1. SHARED MEMORY — always store everything
         global_col = _get_global_collection()
-        global_col.add(documents=[doc_text], metadatas=[metadata], ids=[f"g_{doc_id}"])
+        global_col.add(documents=[doc_text], metadatas=[metadata], ids=[f"g_{base_id}"])
 
-        logger.debug(f"[Memory] Stored exchange in agent_{agent_id} + global ({len(doc_text)} chars)")
+        # 2. PERSONAL MEMORY — route by topic to relevant agents
+        routed_agents = _route_to_agents(
+            text=f"{user_message} {agent_reply}",
+            speaking_agent_id=agent_id,
+        )
+
+        for target_id in routed_agents:
+            agent_col = _get_agent_collection(target_id)
+            personal_id = f"{base_id}_for_{target_id}" if target_id != agent_id else base_id
+            agent_col.add(documents=[doc_text], metadatas=[metadata], ids=[personal_id])
+
+        routed_str = ", ".join(routed_agents)
+        logger.debug(f"[Memory] Stored in global + personal[{routed_str}] ({len(doc_text)} chars)")
     except Exception as e:
         logger.error(f"[Memory] Failed to store exchange for {agent_id}: {e}")
 
@@ -124,8 +227,8 @@ def store_group_round(
     agent_replies: list[dict],
     user_name: str = "",
 ):
-    """Store all exchanges from a conversation round — each goes to the
-    respective agent's personal collection + global."""
+    """Store all exchanges from a conversation round.
+    Each goes to shared memory + topic-routed personal memories."""
     for reply in agent_replies:
         store_exchange(
             session_id=session_id,
@@ -137,7 +240,7 @@ def store_group_round(
         )
 
 
-# ── Retrieve from an agent's personal memory ─────────────────────────
+# ── Retrieve memories ────────────────────────────────────────────────
 
 def _query_collection(collection, query: str, n_results: int = 5) -> list[dict]:
     """Run a semantic query against any ChromaDB collection."""
@@ -171,24 +274,25 @@ def _query_collection(collection, query: str, n_results: int = 5) -> list[dict]:
 
 
 def retrieve_agent_memories(agent_id: str, query: str, n_results: int = 5) -> list[dict]:
-    """Retrieve from this agent's PERSONAL vector store."""
+    """Retrieve from this agent's PERSONAL (role-based) vector store."""
     col = _get_agent_collection(agent_id)
     return _query_collection(col, query, n_results)
 
 
 def retrieve_global_memories(query: str, n_results: int = 5) -> list[dict]:
-    """Retrieve from the GLOBAL collection (all agents)."""
+    """Retrieve from SHARED MEMORY (all raw conversations)."""
     col = _get_global_collection()
     return _query_collection(col, query, n_results)
 
 
 def retrieve_memories(query: str, agent_id: str = "", n_results: int = 5, **kwargs) -> list[dict]:
-    """Backward-compatible retrieval. Uses agent's personal store if agent_id provided,
-    otherwise falls back to global."""
+    """Backward-compatible. agent_id → personal, else → global."""
     if agent_id:
         return retrieve_agent_memories(agent_id, query, n_results)
     return retrieve_global_memories(query, n_results)
 
+
+# ── Format helpers ───────────────────────────────────────────────────
 
 def _format_age(timestamp: float) -> str:
     """Format a timestamp as relative age string."""
@@ -202,37 +306,39 @@ def _format_age(timestamp: float) -> str:
     return f"{int(age_hours / 24)}d ago"
 
 
-def build_memory_context(query: str, agent_id: str = "", n_results: int = 5) -> str:
-    """Build formatted context from an agent's personal memories.
-    If agent_id is provided, searches that agent's personal collection.
-    Otherwise searches the global collection."""
-    memories = retrieve_memories(query=query, agent_id=agent_id, n_results=n_results)
-
+def build_shared_memory_context(query: str, n_results: int = 5) -> str:
+    """Build context from SHARED MEMORY (all raw conversations).
+    This gives agents awareness of the full conversation history."""
+    memories = retrieve_global_memories(query, n_results)
     if not memories:
         return ""
 
-    lines = [f"[RELEVANT MEMORIES FROM YOUR PAST CONVERSATIONS]"]
+    lines = ["[SHARED CONVERSATION HISTORY — what has been discussed across all agents]"]
     for i, mem in enumerate(memories, 1):
-        lines.append(f"\n--- Memory {i} ({_format_age(mem['timestamp'])}) ---")
+        lines.append(f"\n--- Conversation {i} ({_format_age(mem['timestamp'])}) ---")
         lines.append(mem["document"])
-
     return "\n".join(lines)
 
 
 def build_agent_memory_context(agent_id: str, query: str, n_results: int = 5) -> str:
-    """Build RAG context specifically from this agent's personal vector store.
-    This is the primary function for per-agent RAG injection."""
+    """Build context from this agent's PERSONAL (role-based) memory.
+    Contains only exchanges relevant to this agent's expertise."""
     memories = retrieve_agent_memories(agent_id, query, n_results)
-
     if not memories:
         return ""
 
-    lines = [f"[YOUR PERSONAL MEMORIES (from your past conversations)]"]
+    lines = ["[YOUR ROLE-SPECIFIC MEMORIES — topics relevant to your expertise]"]
     for i, mem in enumerate(memories, 1):
         lines.append(f"\n--- Memory {i} ({_format_age(mem['timestamp'])}) ---")
         lines.append(mem["document"])
-
     return "\n".join(lines)
+
+
+def build_memory_context(query: str, agent_id: str = "", n_results: int = 5) -> str:
+    """Backward-compatible. If agent_id → personal, else → global."""
+    if agent_id:
+        return build_agent_memory_context(agent_id, query, n_results)
+    return build_shared_memory_context(query, n_results)
 
 
 # ── Agent Notes (persistent per-agent summaries) ─────────────────────
@@ -293,8 +399,9 @@ def get_agent_memory_stats(agent_id: str) -> dict:
     notes_col = _get_agent_notes_collection(agent_id)
     return {
         "agent_id": agent_id,
-        "exchanges": mem_col.count(),
+        "personal_exchanges": mem_col.count(),
         "notes": notes_col.count(),
+        "topic_keywords": len(_agent_topic_map.get(agent_id, set())),
     }
 
 
@@ -305,15 +412,17 @@ def get_all_memory_stats() -> dict:
     global_col = _get_global_collection()
     return {
         "total_collections": len(collections),
-        "global_exchanges": global_col.count(),
+        "shared_exchanges": global_col.count(),
         "collections": [c.name for c in collections],
+        "topic_router_agents": len(_agent_topic_map),
     }
 
 
-# ── Backfill existing SQLite data into per-agent ChromaDB ────────────
+# ── Backfill existing SQLite data ────────────────────────────────────
 
 def backfill_from_sqlite():
-    """One-time migration: load existing SQLite messages into per-agent ChromaDB."""
+    """One-time migration: load existing SQLite messages into dual-layer ChromaDB.
+    Each exchange goes to shared memory + topic-routed personal memories."""
     try:
         import conversation_store as cs
         conn = cs._get_conn()
@@ -349,7 +458,7 @@ def backfill_from_sqlite():
                     )
                     total_stored += 1
 
-        logger.info(f"[Memory] Backfilled {total_stored} exchanges into per-agent ChromaDB")
+        logger.info(f"[Memory] Backfilled {total_stored} exchanges into dual-layer ChromaDB")
         return total_stored
     except Exception as e:
         logger.error(f"[Memory] Backfill failed: {e}")
