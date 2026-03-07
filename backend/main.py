@@ -515,22 +515,59 @@ async def musetalk_prepare_agents(agent_ids: list[str]):
         await musetalk_prepare(aid)
 
 
+# ── Conversation Orchestrator ────────────────────────────────────────
+# 3-phase conversation engine for natural multi-agent dialogue.
+# Phase 1: Plan — decide who speaks, how many, what style
+# Phase 2: Primary — selected agents respond (with [pass] option)
+# Phase 3: Follow-up — agents react to each other's points
+
+from dataclasses import dataclass as _dataclass, field as _field
+
+# Response style instructions injected per-agent based on conversation plan
+RESPONSE_STYLES = {
+    "lead": (
+        "\n\n[RESPONSE GUIDANCE]: You are the lead responder — the topic is squarely "
+        "in your expertise. Give a thorough, substantive answer (3-8 sentences). "
+        "Share specific examples from your experience. Own this response."
+    ),
+    "contribute": (
+        "\n\n[RESPONSE GUIDANCE]: Another variant is the lead on this topic, but you "
+        "have a relevant perspective. Give a focused 2-4 sentence response. Add a "
+        "different angle, agree/disagree, or share a quick example."
+    ),
+    "react": (
+        "\n\n[RESPONSE GUIDANCE]: You're reacting to what other variants just said. "
+        "Keep it brief — 1-2 sentences. Agree, push back, ask a pointed question, "
+        "or build on their point. Think of it like a quick interjection in a real call."
+    ),
+    "followup": (
+        "\n\n[RESPONSE GUIDANCE]: You're following up on the discussion between variants. "
+        "If you have something meaningful to add — a counter-point, a 'yes and...', "
+        "or a concrete example — say it in 1-3 sentences. If not, respond with [pass]."
+    ),
+}
+
+
+@_dataclass
+class ConversationPlan:
+    """Blueprint for how a conversation round should play out."""
+    primary_speakers: list  # list of (AgentConfig, style) tuples
+    allow_followups: bool = False
+    max_followup_rounds: int = 0
+    topic_type: str = "normal"  # narrow | normal | broad | controversial
+
+
 class ChatSession:
-    """Manages one brainstorming session.
+    """Manages one brainstorming session with natural conversation flow.
 
     Key design decisions:
-    - Each user message triggers a FRESH team run with limited responses.
-    - max_messages = min(len(agents), 3) + 1  →  only 1-3 agents reply per turn.
-    - Team is rebuilt (reset) after every round to prevent history pile-up.
-    - A lightweight conversation_history list is maintained manually so
-      agents have context of previous exchanges without AutoGen's internal
-      state growing unbounded.
-    - Conversations are persisted to SQLite via conversation_store.
-    - Past conversation context is injected into agent system prompts so
-      they "remember" previous sessions.
+    - 3-phase conversation: plan → primary responses → follow-up reactions
+    - Variable number of responders (1-N) based on topic relevance
+    - Agents can [pass] if they have nothing to add
+    - Agents can address each other, not just the user
+    - Response length varies by role: lead (detailed), contribute (normal), react (brief)
+    - Conversations are persisted to SQLite + ChromaDB for memory
     """
-
-    MAX_AGENT_REPLIES_PER_TURN = 2  # At most 2 agents speak per user message (fast turns)
 
     def __init__(self, agent_configs: list[AgentConfig], user_name: str = "",
                  enable_video: bool = False, meeting_id: str = ""):
@@ -712,11 +749,12 @@ class ChatSession:
         return picked
 
     def _build_team(self):
-        """Build (or rebuild) the team with a per-round message cap."""
+        """Build (or rebuild) the AutoGen team.
+        Note: The team is kept for compatibility but conversation flow is now
+        managed by the 3-phase orchestrator in handle_message()."""
         n_agents = len(self.agents)
-        replies = min(n_agents, self.MAX_AGENT_REPLIES_PER_TURN)
-        # +1 for the user message that kicks off the round
-        termination = MaxMessageTermination(max_messages=replies + 1)
+        # Cap at N+1 to prevent runaway — actual orchestration is in handle_message
+        termination = MaxMessageTermination(max_messages=n_agents + 1)
 
         if n_agents >= 2:
             self.team = SelectorGroupChat(
@@ -724,7 +762,7 @@ class ChatSession:
                 model_client=self.model_client,
                 termination_condition=termination,
                 selector_prompt=_selector_prompt(self.user_name or "the user"),
-                allow_repeated_speaker=False,
+                allow_repeated_speaker=True,
                 selector_func=self._keyword_selector,
             )
         else:
@@ -733,35 +771,31 @@ class ChatSession:
                 termination_condition=termination,
             )
         logger.info(
-            f"Team built: {n_agents} agent(s), max {replies} replies per turn (fast selector)"
+            f"Team built: {n_agents} agent(s), orchestrator-managed conversation flow"
         )
 
-    def _pick_next_agent(self, user_message: str, already_spoke: set) -> AgentConfig:
-        """Sparrow-inspired multi-factor agent selector.
+    def _score_all_agents(self, user_message: str) -> list[tuple]:
+        """Score all agents by relevance to the user message.
 
+        Returns list of (AgentConfig, score) sorted by score descending.
         Scoring factors (weighted):
           1. Expertise relevance (0.40) — keyword overlap with user message
-          2. Recency penalty   (0.25) — penalize agents who spoke recently in history
-          3. Diversity bonus    (0.20) — reward agents who haven't been picked much overall
-          4. Reactivity bonus   (0.15) — reward agents who can respond to what prior agents said
+          2. Recency penalty   (0.25) — penalize agents who spoke recently
+          3. Diversity bonus    (0.20) — reward underrepresented agents
+          4. Reactivity bonus   (0.15) — can build on prior replies?
         """
         import random
-        import math
-
-        available = [c for c in self.agent_configs if c.agent_name not in already_spoke]
-        if not available:
-            available = list(self.agent_configs)
 
         last_text = user_message.lower()
 
-        # Count how recently each agent spoke (from conversation_history)
-        recency_map = {}  # agent_variant -> index_from_end (lower = more recent)
+        # Count how recently each agent spoke
+        recency_map = {}
         for i, entry in enumerate(reversed(self.conversation_history)):
             role = entry.get("role", "")
             if role != "user" and role not in recency_map:
-                recency_map[role] = i + 1  # 1-indexed distance from end
+                recency_map[role] = i + 1
 
-        # Count total speaking turns per agent (for diversity)
+        # Count total speaking turns per agent
         turn_counts = {}
         for entry in self.conversation_history:
             role = entry.get("role", "")
@@ -769,7 +803,7 @@ class ChatSession:
                 turn_counts[role] = turn_counts.get(role, 0) + 1
         max_turns = max(turn_counts.values()) if turn_counts else 1
 
-        # Get text from agents who already spoke this round (for reactivity)
+        # Prior agent text for reactivity
         prior_text = " ".join([
             entry.get("text", "")
             for entry in self.conversation_history[-3:]
@@ -777,68 +811,169 @@ class ChatSession:
         ]).lower()
 
         scored = []
-        for cfg in available:
-            # ── Factor 1: Expertise relevance (0-1) ──
+        for cfg in self.agent_configs:
             keywords = set()
             for e in cfg.expertise:
                 keywords.update(e.lower().split())
             keywords.update(cfg.personality.lower().replace(",", " ").split())
             keyword_hits = sum(1 for kw in keywords if kw in last_text and len(kw) > 3)
-            relevance = min(keyword_hits / 3.0, 1.0)  # Normalize: 3+ hits = max
+            relevance = min(keyword_hits / 3.0, 1.0)
 
-            # ── Factor 2: Recency penalty (0-1, higher = better = hasn't spoken recently) ──
             recency_dist = recency_map.get(cfg.variant, len(self.conversation_history) + 5)
-            recency_score = min(recency_dist / 6.0, 1.0)  # 6+ messages ago = max freshness
+            recency_score = min(recency_dist / 6.0, 1.0)
 
-            # ── Factor 3: Diversity bonus (0-1, higher = less dominant) ──
             agent_turns = turn_counts.get(cfg.variant, 0)
             diversity = 1.0 - (agent_turns / (max_turns + 1))
 
-            # ── Factor 4: Reactivity (0-1, can this agent build on prior replies?) ──
             react_hits = sum(1 for kw in keywords if kw in prior_text and len(kw) > 3) if prior_text else 0
             reactivity = min(react_hits / 2.0, 1.0)
 
-            # Weighted composite score
             total = (
                 0.40 * relevance
                 + 0.25 * recency_score
                 + 0.20 * diversity
                 + 0.15 * reactivity
             )
-
-            # Add small random jitter to break ties
             total += random.uniform(0, 0.05)
 
-            scored.append((cfg, total))
+            scored.append((cfg, total, relevance))
             logger.debug(
                 f"[Selector] {cfg.variant}: rel={relevance:.2f} rec={recency_score:.2f} "
                 f"div={diversity:.2f} react={reactivity:.2f} → {total:.3f}"
             )
 
         scored.sort(key=lambda x: -x[1])
-        picked = scored[0][0]
-        logger.info(f"[Selector] Picked: {picked.variant} (score={scored[0][1]:.3f}, from {len(available)} available)")
-        return picked
+        return scored
 
-    def _build_llm_messages(self, agent_cfg: AgentConfig, context: str, prior_replies: list) -> list[dict]:
-        """Build OpenRouter-compatible messages array for an agent."""
+    def _plan_conversation(self, user_message: str) -> ConversationPlan:
+        """Phase 1: Decide who speaks, how many, and what style — zero LLM calls.
+
+        Uses keyword/expertise scoring to determine topic breadth:
+        - Narrow topic (1 expert) → 1 lead speaker, maybe 1 reactor
+        - Normal topic (2-3 experts) → 2-3 speakers with varied styles
+        - Broad topic (4+ experts) → 3-4 speakers + follow-up round
+        """
+        scored = self._score_all_agents(user_message)
+        n_agents = len(self.agent_configs)
+
+        # Classify agents by relevance tier
+        high = [(cfg, s, r) for cfg, s, r in scored if r >= 0.33]  # 1+ strong keyword hits
+        medium = [(cfg, s, r) for cfg, s, r in scored if 0.01 < r < 0.33]
+
+        # Short messages (greetings, "yes", "ok") → just 1-2 agents
+        is_short = len(user_message.split()) <= 4
+
+        if is_short:
+            # Brief input — 1 agent responds conversationally
+            speakers = [(scored[0][0], "contribute")]
+            if n_agents >= 3 and scored[1][1] > 0.3:
+                speakers.append((scored[1][0], "react"))
+            return ConversationPlan(
+                primary_speakers=speakers,
+                allow_followups=False,
+                topic_type="narrow",
+            )
+
+        if len(high) >= 3:
+            # Broad or controversial topic — multiple experts have strong opinions
+            speakers = [(high[0][0], "lead")]
+            for cfg, s, r in high[1:min(4, len(high))]:
+                speakers.append((cfg, "contribute"))
+            return ConversationPlan(
+                primary_speakers=speakers,
+                allow_followups=True,
+                max_followup_rounds=2,
+                topic_type="broad",
+            )
+
+        if len(high) == 2:
+            # Two strong experts — good debate potential
+            speakers = [
+                (high[0][0], "lead"),
+                (high[1][0], "contribute"),
+            ]
+            # Add a reactor if there's a medium-relevance agent
+            if medium and n_agents >= 3:
+                speakers.append((medium[0][0], "react"))
+            return ConversationPlan(
+                primary_speakers=speakers,
+                allow_followups=True,
+                max_followup_rounds=1,
+                topic_type="normal",
+            )
+
+        if len(high) == 1:
+            # Narrow topic — one clear expert
+            speakers = [(high[0][0], "lead")]
+            # Add a contributor from remaining agents (different perspective)
+            remaining = [s for s in scored if s[0] != high[0][0]]
+            if remaining and n_agents >= 2:
+                speakers.append((remaining[0][0], "react"))
+            return ConversationPlan(
+                primary_speakers=speakers,
+                allow_followups=False,
+                max_followup_rounds=0,
+                topic_type="narrow",
+            )
+
+        # No strong keyword match — distribute based on composite score
+        n_speakers = min(n_agents, 3)
+        speakers = [(scored[0][0], "lead")]
+        for i in range(1, n_speakers):
+            speakers.append((scored[i][0], "contribute"))
+        return ConversationPlan(
+            primary_speakers=speakers,
+            allow_followups=n_speakers >= 2,
+            max_followup_rounds=1 if n_speakers >= 2 else 0,
+            topic_type="normal",
+        )
+
+    def _build_llm_messages(self, agent_cfg: AgentConfig, context: str,
+                            prior_replies: list, style: str = "contribute") -> list[dict]:
+        """Build OpenRouter-compatible messages array for an agent.
+
+        Args:
+            agent_cfg: Agent to build messages for
+            context: User message with conversation history
+            prior_replies: List of dicts with 'variant' and 'content' from earlier responses
+            style: One of 'lead', 'contribute', 'react', 'followup' — controls response guidance
+        """
         import perception
         system_msg = self._agent_system_prompts.get(agent_cfg.identity, agent_cfg.system_prompt)
         # Inject user emotional state (Raven-inspired perception)
         emotion_ctx = perception.get_emotion_context()
         if emotion_ctx:
             system_msg += emotion_ctx
+        # Inject response style guidance
+        style_guidance = RESPONSE_STYLES.get(style, RESPONSE_STYLES["contribute"])
+        system_msg += style_guidance
 
         user_content = context
         if prior_replies:
             replies_text = "\n".join([
-                f"[{r['variant']}]: {r['content']}" for r in prior_replies
+                f"{r['variant']}: \"{r['content']}\"" for r in prior_replies
             ])
-            user_content = (
-                context
-                + f"\n\n[Other agents already responded this round]\n{replies_text}"
-                + "\n\n[Now it's your turn to respond. Build on what was said or offer a different perspective.]"
-            )
+            if style == "followup":
+                user_content = (
+                    context
+                    + f"\n\n[Discussion so far this round]\n{replies_text}"
+                    + "\n\n[You're jumping back into the conversation. React to what was said, "
+                    "add a follow-up thought, or respond with [pass] if you have nothing to add.]"
+                )
+            elif style == "react":
+                user_content = (
+                    context
+                    + f"\n\n[Other variants just said]\n{replies_text}"
+                    + "\n\n[Quick — react to what was said. Agree, disagree, or build on it. "
+                    "If you truly have nothing to add, respond with [pass].]"
+                )
+            else:
+                user_content = (
+                    context
+                    + f"\n\n[Other variants already responded]\n{replies_text}"
+                    + "\n\n[Now it's your turn. You can respond to the user, react to what "
+                    "other variants said, or offer a different perspective.]"
+                )
 
         return [
             {"role": "system", "content": system_msg},
@@ -986,16 +1121,68 @@ class ChatSession:
             logger.error(f"Fallback generate failed: {e}")
             return "I apologize, but I'm having trouble responding right now."
 
-    async def handle_message(self, user_message: str, websocket: WebSocket):
-        """Process one user message with Tavus-inspired streaming pipeline.
+    def _is_pass(self, text: str) -> bool:
+        """Check if an agent's response is a [pass] — they chose not to speak."""
+        stripped = text.strip().lower()
+        return stripped in ("[pass]", "pass", "[no comment]", "no comment") or len(stripped) < 3
 
-        Pipeline:
-          1. Pick agent(s) using keyword selector
-          2. For each agent, stream LLM tokens from OpenRouter:
-             - Detect sentence boundaries in real-time
-             - Send text chunks immediately (sub-second first text)
-             - Fire TTS concurrently, send audio in-order
-          3. Persist conversation + generate memory notes
+    async def _run_agent_turn(self, websocket: WebSocket, agent_cfg: AgentConfig,
+                               context: str, prior_replies: list, style: str) -> dict | None:
+        """Run a single agent's turn: typing → LLM stream → text+audio.
+        Returns reply dict or None if agent passed."""
+        # Send typing indicator
+        await websocket.send_json({
+            "type": "agent_typing",
+            "agent_id": agent_cfg.identity,
+            "variant": agent_cfg.variant,
+        })
+
+        # Build messages with style-specific instructions
+        llm_messages = self._build_llm_messages(agent_cfg, context, prior_replies, style)
+
+        try:
+            full_text = await self._stream_agent_response(websocket, agent_cfg, llm_messages)
+        except Exception as e:
+            logger.error(f"Streaming failed for {agent_cfg.variant}, falling back: {e}")
+            try:
+                full_text = await self._fallback_generate(agent_cfg, llm_messages)
+                await _stream_text_and_audio(
+                    websocket, full_text, agent_cfg.voice,
+                    agent_cfg.identity, agent_cfg.agent_name, agent_cfg.variant,
+                )
+            except Exception as e2:
+                logger.error(f"Fallback also failed for {agent_cfg.variant}: {e2}")
+                await websocket.send_json({"type": "error", "content": str(e2)})
+                return None
+
+        # Check if agent passed (chose not to speak)
+        if self._is_pass(full_text):
+            logger.info(f"[Orchestrator] {agent_cfg.variant} passed (style={style})")
+            await websocket.send_json({
+                "type": "agent_skipped",
+                "agent_id": agent_cfg.identity,
+                "variant": agent_cfg.variant,
+            })
+            return None
+
+        return {
+            "variant": agent_cfg.variant,
+            "content": full_text,
+            "agent_id": agent_cfg.identity,
+        }
+
+    async def handle_message(self, user_message: str, websocket: WebSocket):
+        """3-phase conversation engine for natural multi-agent dialogue.
+
+        Phase 1: PLAN — decide who speaks, how many, what style (rule-based, ~0ms)
+        Phase 2: PRIMARY — selected agents respond with role-appropriate styles
+        Phase 3: FOLLOW-UP — agents react to each other's points (optional)
+
+        Key behaviors:
+        - Variable number of responders (1-4) based on topic analysis
+        - Agents can [pass] if they have nothing to add
+        - Lead agents give detailed responses; reactors keep it brief
+        - Follow-up rounds let agents have agent-to-agent conversation
         """
         import time as _time
         t0 = _time.time()
@@ -1004,51 +1191,77 @@ class ChatSession:
         self._active_ws = websocket
         context = self._build_context(user_message)
 
-        n_replies = min(len(self.agent_configs), self.MAX_AGENT_REPLIES_PER_TURN)
-        already_spoke = set()
+        # ── Phase 1: Plan the conversation ──
+        plan = self._plan_conversation(user_message)
+        speaker_names = [cfg.variant for cfg, _ in plan.primary_speakers]
+        logger.info(
+            f"[Orchestrator] Plan: {plan.topic_type} topic, "
+            f"{len(plan.primary_speakers)} speakers ({', '.join(speaker_names)}), "
+            f"followups={'yes' if plan.allow_followups else 'no'}"
+        )
+
         agent_replies = []
 
-        for turn in range(n_replies):
-            # Pick next agent
-            agent_cfg = self._pick_next_agent(user_message, already_spoke)
-            already_spoke.add(agent_cfg.agent_name)
+        # ── Phase 2: Primary responses ──
+        for agent_cfg, style in plan.primary_speakers:
+            reply = await self._run_agent_turn(
+                websocket, agent_cfg, context, agent_replies, style
+            )
+            if reply:
+                elapsed = _time.time() - t0
+                logger.info(f"[Orchestrator] {agent_cfg.variant} replied ({style}) in {elapsed:.1f}s")
+                agent_replies.append(reply)
 
-            # Send typing indicator
-            await websocket.send_json({
-                "type": "agent_typing",
-                "agent_id": agent_cfg.identity,
-                "variant": agent_cfg.variant,
-            })
+        # ── Phase 3: Follow-up rounds ──
+        if plan.allow_followups and plan.max_followup_rounds > 0 and len(agent_replies) >= 2:
+            # Agents who already spoke can jump back in to react to each other
+            primary_ids = {cfg.identity for cfg, _ in plan.primary_speakers}
 
-            # Build messages for OpenRouter
-            llm_messages = self._build_llm_messages(agent_cfg, context, agent_replies)
+            for fround in range(plan.max_followup_rounds):
+                # Pick the agent whose expertise is most relevant to what was just said
+                combined_text = " ".join(r["content"] for r in agent_replies[-3:])
+                scored = self._score_all_agents(combined_text)
 
-            try:
-                # Stream response with interleaved text + audio
-                full_text = await self._stream_agent_response(websocket, agent_cfg, llm_messages)
-            except Exception as e:
-                logger.error(f"Streaming failed for {agent_cfg.variant}, falling back: {e}")
-                try:
-                    full_text = await self._fallback_generate(agent_cfg, llm_messages)
-                    await _stream_text_and_audio(
-                        websocket, full_text, agent_cfg.voice,
-                        agent_cfg.identity, agent_cfg.agent_name, agent_cfg.variant,
-                    )
-                except Exception as e2:
-                    logger.error(f"Fallback also failed for {agent_cfg.variant}: {e2}")
-                    await websocket.send_json({"type": "error", "content": str(e2)})
-                    continue
+                # Find an agent who spoke in primary and has something to react to
+                followup_agent = None
+                for cfg, score, rel in scored:
+                    if cfg.identity in primary_ids and rel > 0.1:
+                        # Check they're not the last speaker (avoid repeating)
+                        if agent_replies and agent_replies[-1]["agent_id"] != cfg.identity:
+                            followup_agent = cfg
+                            break
 
-            elapsed = _time.time() - t0
-            logger.info(f"[handle_message] Agent {agent_cfg.variant} replied in {elapsed:.1f}s")
-            agent_replies.append({
-                "variant": agent_cfg.variant,
-                "content": full_text,
-                "agent_id": agent_cfg.identity,
-            })
+                if not followup_agent:
+                    # Try any agent who hasn't dominated the conversation
+                    spoke_count = {}
+                    for r in agent_replies:
+                        spoke_count[r["agent_id"]] = spoke_count.get(r["agent_id"], 0) + 1
+                    for cfg, score, rel in scored:
+                        if spoke_count.get(cfg.identity, 0) < 2 and \
+                           (not agent_replies or agent_replies[-1]["agent_id"] != cfg.identity):
+                            followup_agent = cfg
+                            break
+
+                if not followup_agent:
+                    logger.info(f"[Orchestrator] No suitable follow-up agent for round {fround+1}")
+                    break
+
+                reply = await self._run_agent_turn(
+                    websocket, followup_agent, context, agent_replies, "followup"
+                )
+                if reply:
+                    logger.info(f"[Orchestrator] Follow-up {fround+1}: {followup_agent.variant}")
+                    agent_replies.append(reply)
+                else:
+                    # Agent passed — no more follow-ups needed
+                    logger.info(f"[Orchestrator] {followup_agent.variant} passed follow-up, ending round")
+                    break
 
         total = _time.time() - t0
-        logger.info(f"[handle_message] Complete: {len(agent_replies)} replies in {total:.1f}s")
+        logger.info(
+            f"[handle_message] Complete: {len(agent_replies)} replies in {total:.1f}s "
+            f"(plan: {plan.topic_type}, {len(plan.primary_speakers)} primary)"
+        )
 
         # Update manual conversation history
         self.conversation_history.append({"role": "user", "text": user_message})
@@ -1057,8 +1270,8 @@ class ChatSession:
                 "role": reply["variant"],
                 "text": reply["content"],
             })
-        if len(self.conversation_history) > 20:
-            self.conversation_history = self.conversation_history[-20:]
+        if len(self.conversation_history) > 30:
+            self.conversation_history = self.conversation_history[-30:]
 
         # Persist to SQLite
         convstore.add_message(self.session_id, "user", user_message, self.user_name or "User")

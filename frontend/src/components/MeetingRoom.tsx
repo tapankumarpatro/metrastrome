@@ -369,6 +369,11 @@ export function MeetingRoom({
         setMessages((prev) => [...history, ...prev]);
         addSystemMessage("Previous conversation loaded.");
 
+      } else if (data.type === "agent_skipped") {
+        // Agent chose to [pass] — they had nothing to add
+        console.log(`[MeetingRoom] ${data.variant} passed`);
+        setIsThinking(false);
+        setThinkingAgent(null);
       } else if (data.type === "round_complete") {
         setIsThinking(false);
         setSpeakingAgentId(null);
