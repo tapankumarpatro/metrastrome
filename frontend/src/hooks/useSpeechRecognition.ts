@@ -25,9 +25,12 @@ export function useSpeechRecognition({
   const recognitionRef = useRef<any>(null);
   const [isListening, setIsListening] = useState(false);
   const [isSupported, setIsSupported] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const enabledRef = useRef(enabled);
   const pauseRef = useRef(pauseWhilePlaying);
   const restartTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const failCountRef = useRef(0);
+  const startAttemptRef = useRef(false);
   enabledRef.current = enabled;
   pauseRef.current = pauseWhilePlaying;
 
@@ -74,17 +77,35 @@ export function useSpeechRecognition({
     };
 
     recognition.onerror = (e: any) => {
-      console.warn("[SpeechRecognition] error:", e.error);
+      console.warn("[BrowserSTT] error:", e.error);
+      failCountRef.current++;
       if (e.error === "not-allowed" || e.error === "service-not-allowed") {
-        console.error("Microphone permission denied — speech recognition disabled");
+        console.error("[BrowserSTT] Microphone permission denied");
+        setError("mic-denied");
         setIsListening(false);
         return;
       }
-      // For "no-speech", "aborted", "network" — let onend handle restart
+      if (e.error === "network") {
+        console.warn("[BrowserSTT] Network error — Google speech service unreachable");
+        if (failCountRef.current > 3) {
+          setError("network");
+          setIsListening(false);
+          return;
+        }
+      }
+      // For "no-speech", "aborted" — let onend handle restart
       setIsListening(false);
     };
 
     recognitionRef.current = recognition;
+    // If a start was requested before recognition was ready, start now
+    if (startAttemptRef.current && enabledRef.current && !pauseRef.current) {
+      try {
+        recognition.start();
+        setIsListening(true);
+        console.log("[BrowserSTT] Deferred start succeeded");
+      } catch { /* will be handled by effect */ }
+    }
 
     return () => {
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
@@ -106,13 +127,22 @@ export function useSpeechRecognition({
     const shouldListen = enabled && !pauseWhilePlaying;
 
     if (shouldListen) {
+      failCountRef.current = 0;
+      setError(null);
       // Small delay to avoid conflicts with audio playback ending
       const timer = setTimeout(() => {
         try {
           recognition.start();
           setIsListening(true);
-        } catch {
-          // already started
+          console.log("[BrowserSTT] Started listening");
+        } catch (err: any) {
+          // "already started" is harmless; other errors should be logged
+          if (err?.message?.includes("already started")) {
+            setIsListening(true);
+          } else {
+            console.warn("[BrowserSTT] Failed to start:", err?.message || err);
+            setError("start-failed");
+          }
         }
       }, 150);
       return () => clearTimeout(timer);
@@ -124,5 +154,38 @@ export function useSpeechRecognition({
     }
   }, [enabled, pauseWhilePlaying]);
 
-  return { isListening, isSupported };
+  // Imperative start — call from a user gesture (click handler) for reliable activation
+  const requestStart = useCallback(() => {
+    const recognition = recognitionRef.current;
+    if (!recognition) {
+      startAttemptRef.current = true; // Will start when recognition is ready
+      console.log("[BrowserSTT] Recognition not ready yet, deferred");
+      return;
+    }
+    try {
+      recognition.start();
+      setIsListening(true);
+      setError(null);
+      failCountRef.current = 0;
+      console.log("[BrowserSTT] Imperative start succeeded");
+    } catch (err: any) {
+      if (err?.message?.includes("already started")) {
+        setIsListening(true);
+      } else {
+        console.warn("[BrowserSTT] Imperative start failed:", err?.message || err);
+        setError("start-failed");
+      }
+    }
+  }, []);
+
+  const requestStop = useCallback(() => {
+    startAttemptRef.current = false;
+    const recognition = recognitionRef.current;
+    if (recognition) {
+      try { recognition.stop(); } catch { /* ignore */ }
+    }
+    setIsListening(false);
+  }, []);
+
+  return { isListening, isSupported, error, requestStart, requestStop };
 }

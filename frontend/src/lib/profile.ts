@@ -11,10 +11,9 @@ export interface UserProfile {
   bio: string;        // short description about the user
   expertise: string;  // comma-separated areas
   photo: string;      // base64 data URI of reference photo (or empty)
-  videoMode: boolean;  // enable MuseTalk video avatars (requires GPU on server)
 }
 
-const EMPTY_PROFILE: UserProfile = { name: "", bio: "", expertise: "", photo: "", videoMode: false };
+const EMPTY_PROFILE: UserProfile = { name: "", bio: "", expertise: "", photo: "" };
 
 export function getProfile(): UserProfile {
   if (typeof window === "undefined") return EMPTY_PROFILE;

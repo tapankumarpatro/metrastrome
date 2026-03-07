@@ -22,14 +22,14 @@ export function MeetingControls({
   unreadCount = 0,
 }: MeetingControlsProps) {
   return (
-    <footer className="flex items-center justify-center gap-3 border-t border-zinc-800 bg-zinc-950 px-6 py-4">
+    <footer className="flex items-center justify-center gap-3 border-t border-slate-200 bg-white/90 backdrop-blur-sm px-6 py-4 shadow-[0_-2px_10px_-3px_rgba(0,0,0,0.05)]">
       {/* Mic */}
       <button
         onClick={onToggleMute}
-        className={`flex h-12 w-12 items-center justify-center rounded-full transition-colors ${
+        className={`flex h-12 w-12 items-center justify-center rounded-full transition-all ${
           isMuted
-            ? "bg-red-500/20 text-red-400 hover:bg-red-500/30"
-            : "bg-zinc-800 text-white hover:bg-zinc-700"
+            ? "bg-red-50 text-red-500 ring-1 ring-red-200 hover:bg-red-100"
+            : "bg-slate-100 text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
         }`}
         title={isMuted ? "Unmute" : "Mute"}
       >
@@ -47,10 +47,10 @@ export function MeetingControls({
       {/* Camera */}
       <button
         onClick={onToggleCamera}
-        className={`flex h-12 w-12 items-center justify-center rounded-full transition-colors ${
+        className={`flex h-12 w-12 items-center justify-center rounded-full transition-all ${
           isCameraOff
-            ? "bg-red-500/20 text-red-400 hover:bg-red-500/30"
-            : "bg-zinc-800 text-white hover:bg-zinc-700"
+            ? "bg-red-50 text-red-500 ring-1 ring-red-200 hover:bg-red-100"
+            : "bg-slate-100 text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
         }`}
         title={isCameraOff ? "Turn on camera" : "Turn off camera"}
       >
@@ -68,10 +68,10 @@ export function MeetingControls({
       {/* Chat toggle */}
       <button
         onClick={onToggleChat}
-        className={`relative flex h-12 w-12 items-center justify-center rounded-full transition-colors ${
+        className={`relative flex h-12 w-12 items-center justify-center rounded-full transition-all ${
           isChatOpen
-            ? "bg-violet-600 text-white hover:bg-violet-500"
-            : "bg-zinc-800 text-white hover:bg-zinc-700"
+            ? "bg-blue-500 text-white shadow-md shadow-blue-200 hover:bg-blue-600"
+            : "bg-slate-100 text-slate-600 ring-1 ring-slate-200 hover:bg-slate-200"
         }`}
         title="Toggle chat"
       >
@@ -88,7 +88,7 @@ export function MeetingControls({
       {/* Leave */}
       <button
         onClick={onLeave}
-        className="ml-4 flex h-12 items-center gap-2 rounded-full bg-red-600 px-6 font-medium text-white transition-colors hover:bg-red-500"
+        className="ml-4 flex h-12 items-center gap-2 rounded-full bg-red-500 px-6 font-medium text-white shadow-md shadow-red-200/50 transition-all hover:bg-red-600 hover:shadow-lg hover:shadow-red-200/60"
       >
         <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
           <path strokeLinecap="round" strokeLinejoin="round" d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3 0l3-3m0 0l-3-3m3 3H9" />

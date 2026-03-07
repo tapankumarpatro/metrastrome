@@ -18,3 +18,7 @@ python-dotenv
 
 # Logging
 loguru
+
+# LiveKit WebRTC (optional — for real-time A/V transport)
+livekit
+livekit-api

@@ -24,6 +24,7 @@ This means an agent's system prompt gets:
 """
 
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -240,17 +241,108 @@ def store_group_round(
         )
 
 
-# ── Retrieve memories ────────────────────────────────────────────────
+def store_file_interaction(
+    session_id: str,
+    agent_id: str,
+    agent_variant: str,
+    filename: str,
+    file_summary: str,
+    user_message: str,
+    agent_reply: str,
+    user_name: str = "",
+):
+    """Store a file review interaction in both shared + personal memory.
+    The file content summary is included so agents can recall what they reviewed.
+    These get higher importance (0.8) so file reviews persist longer in memory."""
+    doc_text = (
+        f"[FILE SHARED: {filename}]\n"
+        f"User ({user_name or 'User'}) shared a file for review: {filename}\n"
+        f"File summary: {file_summary[:2000]}\n"
+        f"User's request: {user_message}\n"
+        f"{agent_variant}'s analysis: {agent_reply}"
+    )
+    ts = time.time()
+    base_id = f"{session_id}_file_{agent_id}_{int(ts * 1000)}"
+
+    metadata = {
+        "session_id": session_id,
+        "agent_id": agent_id,
+        "agent_variant": agent_variant,
+        "user_name": user_name,
+        "timestamp": ts,
+        "user_message": user_message[:500],
+        "agent_reply": agent_reply[:500],
+        "filename": filename,
+        "importance": 0.8,  # file reviews are high-importance memories
+        "type": "file_review",
+    }
+
+    try:
+        # Shared memory
+        global_col = _get_global_collection()
+        global_col.add(documents=[doc_text], metadatas=[metadata], ids=[f"g_{base_id}"])
+
+        # Personal memory — route to relevant agents
+        routed_agents = _route_to_agents(
+            text=f"{user_message} {file_summary} {agent_reply}",
+            speaking_agent_id=agent_id,
+        )
+        for target_id in routed_agents:
+            agent_col = _get_agent_collection(target_id)
+            pid = f"{base_id}_for_{target_id}" if target_id != agent_id else base_id
+            agent_col.add(documents=[doc_text], metadatas=[metadata], ids=[pid])
+
+        logger.info(f"[Memory] Stored file interaction '{filename}' for {agent_variant} + {len(routed_agents)} routed agents")
+    except Exception as e:
+        logger.error(f"[Memory] Failed to store file interaction: {e}")
+
+
+# ── Recency-weighted memory retrieval (mem0-inspired) ────────────────
+#
+# Instead of pure cosine-similarity ranking, we use a composite score:
+#   score = (W_SIM * similarity) + (W_REC * recency_decay) + (W_IMP * importance)
+# This gives recent memories higher priority while keeping old important
+# ones accessible — like how humans remember.
+
+W_SIM = 0.40   # semantic similarity weight
+W_REC = 0.35   # recency decay weight
+W_IMP = 0.25   # importance weight (currently uniform; can be LLM-scored later)
+LAMBDA_DECAY = 0.05  # decay rate: exp(-λ * days).  ~50% at 14 days, ~18% at 30 days
+
+
+def _recency_decay(timestamp: float) -> float:
+    """Exponential decay based on age.  Returns 0.0–1.0 (1.0 = just stored)."""
+    if not timestamp:
+        return 0.0
+    days_old = max(0, (time.time() - timestamp) / 86400)
+    return math.exp(-LAMBDA_DECAY * days_old)
+
+
+def _composite_score(distance: float, timestamp: float, importance: float = 0.5) -> float:
+    """Compute mem0-style composite score.  Higher = better.
+    distance: ChromaDB cosine distance (0 = identical, 2 = opposite).
+    importance: 0.0–1.0 (default 0.5; can be set per-memory later)."""
+    # Convert cosine distance → similarity (0–1 range)
+    similarity = max(0.0, 1.0 - distance / 2.0)
+    recency = _recency_decay(timestamp)
+    return (W_SIM * similarity) + (W_REC * recency) + (W_IMP * importance)
+
 
 def _query_collection(collection, query: str, n_results: int = 5) -> list[dict]:
-    """Run a semantic query against any ChromaDB collection."""
-    if collection.count() == 0:
+    """Semantic query with recency-weighted re-ranking.
+    Fetches 3× candidates from ChromaDB, re-scores with composite formula,
+    then returns the top n_results."""
+    count = collection.count()
+    if count == 0:
         return []
+
+    # Fetch more candidates to allow recency re-ranking to surface recent items
+    fetch_n = min(count, n_results * 3)
 
     try:
         results = collection.query(
             query_texts=[query],
-            n_results=min(n_results, collection.count()),
+            n_results=fetch_n,
         )
     except Exception as e:
         logger.error(f"[Memory] Query failed: {e}")
@@ -261,16 +353,23 @@ def _query_collection(collection, query: str, n_results: int = 5) -> list[dict]:
         for i, doc in enumerate(results["documents"][0]):
             meta = results["metadatas"][0][i] if results["metadatas"] else {}
             dist = results["distances"][0][i] if results["distances"] else 1.0
+            ts = meta.get("timestamp", 0)
+            importance = meta.get("importance", 0.5)
+            score = _composite_score(dist, ts, importance)
             memories.append({
                 "document": doc,
                 "user_message": meta.get("user_message", ""),
                 "agent_reply": meta.get("agent_reply", ""),
                 "agent_variant": meta.get("agent_variant", ""),
                 "agent_id": meta.get("agent_id", ""),
-                "timestamp": meta.get("timestamp", 0),
+                "timestamp": ts,
                 "distance": dist,
+                "score": score,
             })
-    return memories
+
+    # Sort by composite score (descending — higher is better)
+    memories.sort(key=lambda m: m["score"], reverse=True)
+    return memories[:n_results]
 
 
 def retrieve_agent_memories(agent_id: str, query: str, n_results: int = 5) -> list[dict]:
@@ -308,28 +407,34 @@ def _format_age(timestamp: float) -> str:
 
 def build_shared_memory_context(query: str, n_results: int = 5) -> str:
     """Build context from SHARED MEMORY (all raw conversations).
-    This gives agents awareness of the full conversation history."""
+    This gives agents awareness of the full conversation history.
+    Results are ranked by composite score (similarity + recency + importance)."""
     memories = retrieve_global_memories(query, n_results)
     if not memories:
         return ""
 
-    lines = ["[SHARED CONVERSATION HISTORY — what has been discussed across all agents]"]
+    lines = ["[SHARED CONVERSATION HISTORY — ranked by relevance × recency]"]
     for i, mem in enumerate(memories, 1):
-        lines.append(f"\n--- Conversation {i} ({_format_age(mem['timestamp'])}) ---")
+        age = _format_age(mem['timestamp'])
+        score = mem.get('score', 0)
+        lines.append(f"\n--- Conversation {i} ({age}, relevance: {score:.0%}) ---")
         lines.append(mem["document"])
     return "\n".join(lines)
 
 
 def build_agent_memory_context(agent_id: str, query: str, n_results: int = 5) -> str:
     """Build context from this agent's PERSONAL (role-based) memory.
-    Contains only exchanges relevant to this agent's expertise."""
+    Contains only exchanges relevant to this agent's expertise.
+    Results are ranked by composite score (similarity + recency + importance)."""
     memories = retrieve_agent_memories(agent_id, query, n_results)
     if not memories:
         return ""
 
-    lines = ["[YOUR ROLE-SPECIFIC MEMORIES — topics relevant to your expertise]"]
+    lines = ["[YOUR ROLE-SPECIFIC MEMORIES — ranked by relevance × recency]"]
     for i, mem in enumerate(memories, 1):
-        lines.append(f"\n--- Memory {i} ({_format_age(mem['timestamp'])}) ---")
+        age = _format_age(mem['timestamp'])
+        score = mem.get('score', 0)
+        lines.append(f"\n--- Memory {i} ({age}, relevance: {score:.0%}) ---")
         lines.append(mem["document"])
     return "\n".join(lines)
 

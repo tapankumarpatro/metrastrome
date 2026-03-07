@@ -37,9 +37,9 @@ export function ParticipantTile({
     <div
       className={`group relative flex aspect-video flex-col items-center justify-center overflow-hidden rounded-2xl transition-all duration-500 ${
         isSpeaking
-          ? "ring-2 ring-emerald-500/80 shadow-xl shadow-emerald-500/25"
-          : "ring-1 ring-zinc-800/80"
-      } ${isLocal ? "bg-zinc-900" : "bg-zinc-900/80"}`}
+          ? "ring-2 ring-emerald-400/70 shadow-lg shadow-emerald-200/40"
+          : "ring-1 ring-slate-200 shadow-md shadow-slate-200/50"
+      } ${isLocal ? "bg-white" : "bg-white"}`}
     >
       {/* Agent photo background with speaking zoom effect */}
       {agent && hasImage && (
@@ -50,16 +50,16 @@ export function ParticipantTile({
             alt={agent.variant}
             className={`absolute inset-0 h-full w-full object-cover object-top transition-all duration-700 ease-out ${
               isSpeaking
-                ? "scale-110 opacity-60"
-                : "scale-100 opacity-40"
+                ? "scale-110 opacity-50"
+                : "scale-100 opacity-30"
             }`}
             onError={() => setImgError(true)}
           />
           <div
             className={`absolute inset-0 transition-all duration-700 ${
               isSpeaking
-                ? "bg-gradient-to-t from-zinc-900 via-zinc-900/40 to-transparent"
-                : "bg-gradient-to-t from-zinc-900 via-zinc-900/60 to-transparent"
+                ? "bg-gradient-to-t from-white via-white/50 to-transparent"
+                : "bg-gradient-to-t from-white via-white/70 to-transparent"
             }`}
           />
         </>
@@ -67,10 +67,10 @@ export function ParticipantTile({
 
       {/* Emoji background when no image */}
       {agent && !hasImage && (
-        <div className={`absolute inset-0 flex items-center justify-center ${agent.iconBg}`}>
+        <div className={`absolute inset-0 flex items-center justify-center bg-slate-50`}>
           <span
             className={`select-none transition-all duration-500 ${
-              isSpeaking ? "text-8xl scale-110" : "text-7xl scale-100 opacity-30"
+              isSpeaking ? "text-8xl scale-110" : "text-7xl scale-100 opacity-40"
             }`}
           >
             {agent.emoji || "🤖"}
@@ -81,7 +81,7 @@ export function ParticipantTile({
       {/* Speaking glow ring pulse */}
       {isSpeaking && (
         <div className="pointer-events-none absolute inset-0 z-10">
-          <div className="absolute inset-0 rounded-2xl ring-1 ring-emerald-400/30" style={{ animation: 'speakPulse 2s ease-in-out infinite' }} />
+          <div className="absolute inset-0 rounded-2xl ring-1 ring-emerald-300/40" style={{ animation: 'speakPulse 2s ease-in-out infinite' }} />
         </div>
       )}
 
@@ -99,8 +99,8 @@ export function ParticipantTile({
             <div
               className={`relative h-16 w-16 overflow-hidden rounded-full transition-all duration-500 ${
                 isSpeaking
-                  ? "ring-2 ring-emerald-400/60"
-                  : "ring-2 ring-white/20"
+                  ? "ring-2 ring-emerald-400/60 shadow-lg shadow-emerald-100"
+                  : "ring-2 ring-slate-200 shadow-sm"
               }`}
             >
               {hasImage ? (
@@ -131,8 +131,8 @@ export function ParticipantTile({
 
         {/* Name + role */}
         <div className="mt-2 flex flex-col items-center">
-          <span className="text-sm font-medium text-white">{name}</span>
-          <span className="text-[11px] text-zinc-400">{role}</span>
+          <span className="text-sm font-medium text-slate-800">{name}</span>
+          <span className="text-[11px] text-slate-400">{role}</span>
         </div>
       </div>
 
@@ -158,10 +158,10 @@ export function ParticipantTile({
           className={`h-2 w-2 rounded-full ${
             isLocal
               ? isConnected ? "bg-emerald-500" : "bg-amber-500 animate-pulse"
-              : isConnected ? "bg-emerald-500" : "bg-zinc-600"
+              : isConnected ? "bg-emerald-500" : "bg-slate-300"
           }`}
         />
-        <span className="text-[10px] text-zinc-400">
+        <span className="text-[10px] text-slate-400">
           {isLocal
             ? isConnected ? "You" : "Connecting..."
             : isConnected ? "Live" : "Not joined yet"}

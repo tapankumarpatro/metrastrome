@@ -14,6 +14,7 @@ function MeetContent() {
   const router = useRouter();
   const identity = searchParams.get("identity");
   const agentsParam = searchParams.get("agents") || "";
+  const meetingId = searchParams.get("meeting_id") || undefined;
 
   const [agents, setAgents] = useState<AgentInfo[]>(getAgentsCache());
   const [loading, setLoading] = useState(agents.length === 0);
@@ -39,8 +40,8 @@ function MeetContent() {
 
   if (loading) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-zinc-950">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-zinc-700 border-t-blue-500" />
+      <div className="flex min-h-screen items-center justify-center bg-slate-50">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-slate-200 border-t-blue-500" />
       </div>
     );
   }
@@ -54,6 +55,7 @@ function MeetContent() {
       identity={identity}
       enabledAgents={enabledAgents}
       onLeave={() => router.push("/")}
+      meetingId={meetingId}
     />
   );
 }
@@ -62,8 +64,8 @@ export default function MeetPage() {
   return (
     <Suspense
       fallback={
-        <div className="flex min-h-screen items-center justify-center bg-zinc-950">
-          <div className="h-8 w-8 animate-spin rounded-full border-2 border-zinc-700 border-t-blue-500" />
+        <div className="flex min-h-screen items-center justify-center bg-slate-50">
+          <div className="h-8 w-8 animate-spin rounded-full border-2 border-slate-200 border-t-blue-500" />
         </div>
       }
     >

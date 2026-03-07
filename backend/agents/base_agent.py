@@ -1,5 +1,5 @@
 """
-The Multiverse of Tapan — Agent Definitions (AutoGen Edition)
+The Multiverse — Agent Definitions (AutoGen Edition)
 
 Loads agent config from agents.config.json in the project root.
 Users can edit that JSON to add/modify agents without touching code.
@@ -18,32 +18,34 @@ from loguru import logger
 
 
 # ── Shared prompt fragments ──────────────────────────────────────────
-COMMON_IDENTITY = (
-    "You are Tapan — one specific version of Tapan from a multiverse of "
-    "possibilities. In every universe you share the same core: deeply curious, "
-    "relentlessly driven, slightly irreverent, and genuinely passionate about "
-    "what you do. But each version of you diverged at a crossroads and became "
-    "something different.\n\n"
-)
+def _common_identity(owner: str = "You") -> str:
+    return (
+        f"You are {owner} — one specific version of {owner} from a multiverse of "
+        "possibilities. In every universe you share the same core: deeply curious, "
+        "relentlessly driven, slightly irreverent, and genuinely passionate about "
+        "what you do. But each version of you diverged at a crossroads and became "
+        "something different.\n\n"
+    )
 
-COMMON_CHAT_RULES = (
-    "\n\nRULES FOR THIS CONVERSATION: "
-    "You are on a live voice call with a human user and possibly other Tapan "
-    "variants. Respond like you're talking, not writing. Keep replies SHORT — "
-    "1-3 sentences max. Be warm, natural, conversational. Use contractions. "
-    "Respond ONLY to what the user just said. Do NOT ask multiple questions "
-    "at once — ask one thing, then wait. Do NOT reference any Tapan variant "
-    "who is not listed in the PARTICIPANTS section. Do NOT use bullet points "
-    "or numbered lists. Do NOT repeat yourself or paraphrase what you just said. "
-    "When relevant, reference your specific PROJECTS and WORK HISTORY — share "
-    "concrete examples, metrics, and lessons from your past work. This makes "
-    "your advice grounded and real, not generic."
-)
+def _common_chat_rules(owner: str = "You") -> str:
+    return (
+        "\n\nRULES FOR THIS CONVERSATION: "
+        f"You are on a live voice call with a human user and possibly other {owner} "
+        "variants. Respond like you're talking, not writing. Keep replies SHORT — "
+        "1-3 sentences max. Be warm, natural, conversational. Use contractions. "
+        "Respond ONLY to what the user just said. Do NOT ask multiple questions "
+        f"at once — ask one thing, then wait. Do NOT reference any {owner} variant "
+        "who is not listed in the PARTICIPANTS section. Do NOT use bullet points "
+        "or numbered lists. Do NOT repeat yourself or paraphrase what you just said. "
+        "When relevant, reference your specific PROJECTS and WORK HISTORY — share "
+        "concrete examples, metrics, and lessons from your past work. This makes "
+        "your advice grounded and real, not generic."
+    )
 
 
 @dataclass
 class AgentConfig:
-    """Configuration for a Tapan variant used by AutoGen."""
+    """Configuration for an agent variant used by AutoGen."""
 
     agent_name: str        # AutoGen agent name (e.g. "TheVisionary")
     identity: str          # slug id (e.g. "tapan-visionary")
@@ -61,16 +63,17 @@ class AgentConfig:
     projects: List[dict] = field(default_factory=list)
 
 
-def _build_system_prompt(agent_data: dict) -> str:
+def _build_system_prompt(agent_data: dict, owner_name: str = "") -> str:
     """Build a full system prompt from structured JSON data."""
     variant = agent_data["variant"]
     backstory = agent_data.get("backstory", "")
     expertise = agent_data.get("expertise", [])
     projects = agent_data.get("projects", [])
+    owner = owner_name or "You"
 
     # Identity section
-    prompt = COMMON_IDENTITY
-    prompt += f"In this universe, you are Tapan {variant}. {backstory} "
+    prompt = _common_identity(owner)
+    prompt += f"In this universe, you are {owner} {variant}. {backstory} "
 
     # Expertise
     if expertise:
@@ -100,7 +103,7 @@ def _build_system_prompt(agent_data: dict) -> str:
                 prompt += f" Lesson: {lesson}"
             prompt += "\n"
 
-    prompt += COMMON_CHAT_RULES
+    prompt += _common_chat_rules(owner)
     return prompt
 
 
@@ -173,15 +176,28 @@ def load_agents_from_json() -> Dict[str, AgentConfig]:
 
 # Load on import
 AGENT_REGISTRY = load_agents_from_json()
-DEFAULT_AGENT = AGENT_REGISTRY.get("tapan-architect") or next(iter(AGENT_REGISTRY.values()), None)
+DEFAULT_AGENT = next(iter(AGENT_REGISTRY.values()), None)
 
 
 def reload_agents() -> Dict[str, AgentConfig]:
     """Reload agents from agents.config.json (call after add/remove)."""
     global AGENT_REGISTRY, DEFAULT_AGENT
     AGENT_REGISTRY = load_agents_from_json()
-    DEFAULT_AGENT = AGENT_REGISTRY.get("tapan-architect") or next(iter(AGENT_REGISTRY.values()), None)
+    DEFAULT_AGENT = next(iter(AGENT_REGISTRY.values()), None)
     return AGENT_REGISTRY
+
+
+def rebuild_prompt_for_owner(cfg: AgentConfig, owner_name: str) -> str:
+    """Rebuild a system prompt personalized with the owner's name.
+    Re-generates from the AgentConfig fields (variant, backstory, expertise, projects).
+    Falls back to the existing system_prompt if it was a custom override."""
+    agent_data = {
+        "variant": cfg.variant,
+        "backstory": cfg.backstory,
+        "expertise": cfg.expertise,
+        "projects": cfg.projects,
+    }
+    return _build_system_prompt(agent_data, owner_name=owner_name)
 
 
 def get_config_path() -> Path:

@@ -124,6 +124,7 @@ export interface AgentConfigData {
   description: string;
   voice: string;
   image: string;
+  image_prompt?: string;
   projects: {
     name: string;
     role: string;
@@ -185,7 +186,8 @@ export async function generateAgentConfigStream(
             } else if (eventType === "result") {
               result = parsed;
             } else if (eventType === "error") {
-              result = parsed;
+              // Ensure error is never empty string (falsy)
+              result = { error: parsed.error || "Unknown generation error" };
             }
           } catch {
             // skip malformed JSON
@@ -229,6 +231,39 @@ export async function deleteAgent(
   try {
     const res = await fetch(`${API_URL}/agents/${agentId}`, {
       method: "DELETE",
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: String(err) };
+  }
+}
+
+export async function uploadAgentImage(
+  agentId: string,
+  photoDataUri: string,
+): Promise<{ ok?: boolean; image?: string; error?: string }> {
+  try {
+    const res = await fetch(`${API_URL}/agents/upload-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_id: agentId, photo: photoDataUri }),
+    });
+    return await res.json();
+  } catch (err) {
+    return { error: String(err) };
+  }
+}
+
+export async function regenerateAgentImage(
+  agentId: string,
+  imagePrompt: string,
+  agentType: string = "variant",
+): Promise<{ ok?: boolean; image?: string; error?: string }> {
+  try {
+    const res = await fetch(`${API_URL}/agents/regenerate-image`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ agent_id: agentId, image_prompt: imagePrompt, agent_type: agentType }),
     });
     return await res.json();
   } catch (err) {

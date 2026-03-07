@@ -8,12 +8,35 @@ import { getProfile, isProfileComplete } from "@/lib/profile";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
+function formatTimeAgo(unixSeconds: number): string {
+  if (!unixSeconds) return "";
+  const now = Date.now() / 1000;
+  const diff = now - unixSeconds;
+  if (diff < 60) return "just now";
+  if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
+  if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
+  if (diff < 604800) return `${Math.floor(diff / 86400)}d ago`;
+  return new Date(unixSeconds * 1000).toLocaleDateString();
+}
+
 interface ChatMessage {
   role: string;
   variant: string;
   content: string;
   timestamp: number;
   isUser: boolean;
+}
+
+interface MeetingInfo {
+  id: string;
+  title: string;
+  created_at: number;
+  last_active: number;
+  agents: { id: string; variant: string; emoji: string; image: string }[];
+  agent_ids: string[];
+  user_name: string;
+  message_count: number;
+  last_message: string;
 }
 
 export default function FeedPage() {
@@ -25,6 +48,9 @@ export default function FeedPage() {
   const [chatInput, setChatInput] = useState("");
   const [sending, setSending] = useState(false);
   const [loadingHistory, setLoadingHistory] = useState(false);
+  const [activeTab, setActiveTab] = useState<"meetings" | "chats">("meetings");
+  const [meetings, setMeetings] = useState<MeetingInfo[]>([]);
+  const [loadingMeetings, setLoadingMeetings] = useState(false);
   const chatEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -40,6 +66,31 @@ export default function FeedPage() {
       setLoading(false);
     });
   }, [agents.length, router]);
+
+  // Load meetings list
+  useEffect(() => {
+    if (activeTab !== "meetings") return;
+    setLoadingMeetings(true);
+    fetch(`${API_URL}/meetings?limit=30`)
+      .then((r) => r.json())
+      .then((data) => setMeetings(data.meetings || []))
+      .catch(() => {})
+      .finally(() => setLoadingMeetings(false));
+  }, [activeTab]);
+
+  const deleteMeeting = useCallback(async (id: string) => {
+    if (!confirm("Delete this meeting and all its messages?")) return;
+    await fetch(`${API_URL}/meetings/${id}`, { method: "DELETE" });
+    setMeetings((prev) => prev.filter((m) => m.id !== id));
+  }, []);
+
+  const rejoinMeeting = useCallback((meeting: MeetingInfo) => {
+    const identity = meeting.user_name || getProfile().name || "user";
+    const agentIds = meeting.agent_ids.join(",");
+    router.push(
+      `/meet?identity=${encodeURIComponent(identity)}&agents=${encodeURIComponent(agentIds)}&meeting_id=${encodeURIComponent(meeting.id)}`
+    );
+  }, [router]);
 
   // Load chat history when agent selected
   useEffect(() => {
@@ -145,7 +196,7 @@ export default function FeedPage() {
 
   return (
     <div className="flex h-screen bg-slate-50">
-      {/* ── Left sidebar: Agent list ── */}
+      {/* ── Left sidebar: Tabs + content ── */}
       <aside className="flex w-80 shrink-0 flex-col border-r border-slate-200 bg-white">
         {/* Header */}
         <div className="flex items-center justify-between border-b border-slate-100 px-4 py-3">
@@ -166,43 +217,144 @@ export default function FeedPage() {
           </div>
         </div>
 
-        {/* Agent cards */}
+        {/* Tabs */}
+        <div className="flex border-b border-slate-100">
+          <button
+            onClick={() => { setActiveTab("meetings"); setSelectedAgent(null); }}
+            className={`flex-1 py-2.5 text-xs font-semibold transition ${
+              activeTab === "meetings"
+                ? "text-blue-600 border-b-2 border-blue-600"
+                : "text-slate-400 hover:text-slate-600"
+            }`}
+          >
+            Meetings
+          </button>
+          <button
+            onClick={() => setActiveTab("chats")}
+            className={`flex-1 py-2.5 text-xs font-semibold transition ${
+              activeTab === "chats"
+                ? "text-blue-600 border-b-2 border-blue-600"
+                : "text-slate-400 hover:text-slate-600"
+            }`}
+          >
+            1-on-1 Chats
+          </button>
+        </div>
+
+        {/* Tab content */}
         <div className="flex-1 overflow-y-auto p-2 space-y-1">
-          {agents.map((agent) => {
-            const isActive = selectedAgent?.id === agent.id;
-            return (
-              <button
-                key={agent.id}
-                onClick={() => setSelectedAgent(agent)}
-                className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition ${
-                  isActive
-                    ? "bg-blue-50 ring-1 ring-blue-200"
-                    : "hover:bg-slate-50"
-                }`}
-              >
-                <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${agent.iconBg}`}>
-                  {agent.image ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={agent.image}
-                      alt={agent.variant}
-                      className="h-10 w-10 rounded-full object-cover"
-                    />
-                  ) : (
-                    <span className="text-lg">{agent.emoji || "🤖"}</span>
-                  )}
+          {activeTab === "meetings" ? (
+            <>
+              {loadingMeetings && (
+                <div className="flex justify-center py-8">
+                  <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-blue-500" />
                 </div>
-                <div className="min-w-0 flex-1">
-                  <div className="truncate text-sm font-semibold text-slate-800">
-                    {agent.variant}
+              )}
+              {!loadingMeetings && meetings.length === 0 && (
+                <div className="py-10 text-center">
+                  <p className="text-sm text-slate-400">No meetings yet</p>
+                  <p className="mt-1 text-xs text-slate-300">Start a meeting from the home page</p>
+                </div>
+              )}
+              {meetings.map((meeting) => (
+                <div
+                  key={meeting.id}
+                  className="group rounded-xl border border-slate-100 p-3 transition hover:bg-slate-50 hover:border-slate-200"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-sm font-semibold text-slate-800">
+                        {meeting.title}
+                      </div>
+                      <div className="mt-0.5 flex items-center gap-1.5">
+                        {/* Agent avatars */}
+                        <div className="flex -space-x-1.5">
+                          {meeting.agents.slice(0, 4).map((a) => (
+                            <div
+                              key={a.id}
+                              className="flex h-5 w-5 items-center justify-center rounded-full bg-slate-200 ring-1 ring-white text-[9px]"
+                              title={a.variant}
+                            >
+                              {a.image ? (
+                                // eslint-disable-next-line @next/next/no-img-element
+                                <img src={a.image} alt={a.variant} className="h-5 w-5 rounded-full object-cover" />
+                              ) : (
+                                a.emoji || "🤖"
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                        <span className="text-[10px] text-slate-400">
+                          {meeting.message_count} msgs
+                        </span>
+                      </div>
+                      {meeting.last_message && (
+                        <p className="mt-1 truncate text-[11px] text-slate-400">
+                          {meeting.last_message}
+                        </p>
+                      )}
+                    </div>
+                    <div className="flex flex-col items-end gap-1 shrink-0">
+                      <span className="text-[10px] text-slate-300">
+                        {formatTimeAgo(meeting.last_active)}
+                      </span>
+                    </div>
                   </div>
-                  <div className="truncate text-[11px] text-slate-400">
-                    {agent.personality.split(",")[0]}
+                  <div className="mt-2 flex gap-2 opacity-0 group-hover:opacity-100 transition">
+                    <button
+                      onClick={() => rejoinMeeting(meeting)}
+                      className="flex-1 rounded-lg bg-blue-600 px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-blue-700 transition"
+                    >
+                      Rejoin
+                    </button>
+                    <button
+                      onClick={() => deleteMeeting(meeting.id)}
+                      className="rounded-lg border border-slate-200 px-2.5 py-1.5 text-[11px] text-slate-400 hover:border-red-200 hover:text-red-500 transition"
+                    >
+                      Delete
+                    </button>
                   </div>
                 </div>
-              </button>
-            );
-          })}
+              ))}
+            </>
+          ) : (
+            /* 1-on-1 agent chats list */
+            agents.map((agent) => {
+              const isActive = selectedAgent?.id === agent.id;
+              return (
+                <button
+                  key={agent.id}
+                  onClick={() => setSelectedAgent(agent)}
+                  className={`flex w-full items-center gap-3 rounded-xl px-3 py-2.5 text-left transition ${
+                    isActive
+                      ? "bg-blue-50 ring-1 ring-blue-200"
+                      : "hover:bg-slate-50"
+                  }`}
+                >
+                  <div className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-full ${agent.iconBg}`}>
+                    {agent.image ? (
+                      // eslint-disable-next-line @next/next/no-img-element
+                      <img
+                        src={agent.image}
+                        alt={agent.variant}
+                        className="h-10 w-10 rounded-full object-cover"
+                      />
+                    ) : (
+                      <span className="text-lg">{agent.emoji || "🤖"}</span>
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate text-sm font-semibold text-slate-800">
+                      {agent.variant}
+                    </div>
+                    <div className="truncate text-[11px] text-slate-400">
+                      {agent.personality.split(",")[0]}
+                    </div>
+                  </div>
+                </button>
+              );
+            })
+          )}
         </div>
       </aside>
 
@@ -322,16 +474,28 @@ export default function FeedPage() {
             </div>
           </>
         ) : (
-          /* No agent selected */
+          /* No agent/meeting selected */
           <div className="flex flex-1 flex-col items-center justify-center text-center">
             <div className="flex h-20 w-20 items-center justify-center rounded-2xl bg-slate-100 mb-4">
-              <svg className="h-10 w-10 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
-                <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />
-              </svg>
+              {activeTab === "meetings" ? (
+                <svg className="h-10 w-10 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M15 19.128a9.38 9.38 0 002.625.372 9.337 9.337 0 004.121-.952 4.125 4.125 0 00-7.533-2.493M15 19.128v-.003c0-1.113-.285-2.16-.786-3.07M15 19.128v.106A12.318 12.318 0 018.624 21c-2.331 0-4.512-.645-6.374-1.766l-.001-.109a6.375 6.375 0 0111.964-3.07M12 6.375a3.375 3.375 0 11-6.75 0 3.375 3.375 0 016.75 0zm8.25 2.25a2.625 2.625 0 11-5.25 0 2.625 2.625 0 015.25 0z" />
+                </svg>
+              ) : (
+                <svg className="h-10 w-10 text-slate-300" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M8.625 12a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H8.25m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0H12m4.125 0a.375.375 0 11-.75 0 .375.375 0 01.75 0zm0 0h-.375M21 12c0 4.556-4.03 8.25-9 8.25a9.764 9.764 0 01-2.555-.337A5.972 5.972 0 015.41 20.97a5.969 5.969 0 01-.474-.065 4.48 4.48 0 00.978-2.025c.09-.457-.133-.901-.467-1.226C3.93 16.178 3 14.189 3 12c0-4.556 4.03-8.25 9-8.25s9 3.694 9 8.25z" />
+                </svg>
+              )}
             </div>
-            <h2 className="text-lg font-semibold text-slate-700">Select an agent to chat</h2>
+            <h2 className="text-lg font-semibold text-slate-700">
+              {activeTab === "meetings"
+                ? "Select a meeting to rejoin"
+                : "Select an agent to chat"}
+            </h2>
             <p className="mt-1 text-sm text-slate-400 max-w-sm">
-              Pick any agent from the sidebar to start a 1-on-1 conversation. They remember your past meetings.
+              {activeTab === "meetings"
+                ? "Pick a past meeting from the sidebar to continue where you left off. All chat history is preserved."
+                : "Pick any agent from the sidebar to start a 1-on-1 conversation. They remember your past meetings."}
             </p>
           </div>
         )}

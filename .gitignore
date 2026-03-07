@@ -54,6 +54,9 @@ npm-debug.log*
 # ChromaDB vector store
 backend/chroma_data/
 
+# Chat file uploads
+backend/uploads/
+
 # Generated images (keep directory via .gitkeep)
 frontend/public/images/*.jpg
 frontend/public/images/*.png

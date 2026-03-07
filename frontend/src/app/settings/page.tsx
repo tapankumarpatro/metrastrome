@@ -8,6 +8,8 @@ import {
   generateAgentConfigStream,
   addAgent,
   deleteAgent,
+  uploadAgentImage,
+  regenerateAgentImage,
   AgentInfo,
   AgentConfigData,
   GenerationProgress,
@@ -38,7 +40,7 @@ export default function SettingsPage() {
   const [loading, setLoading] = useState(true);
 
   // ── About Me state ──
-  const [profile, setProfile] = useState<UserProfile>({ name: "", bio: "", expertise: "", photo: "", videoMode: false });
+  const [profile, setProfile] = useState<UserProfile>({ name: "", bio: "", expertise: "", photo: "" });
   const [profileSaved, setProfileSaved] = useState(false);
 
   // "I want to talk to" form state
@@ -52,6 +54,11 @@ export default function SettingsPage() {
   const [progressLog, setProgressLog] = useState<GenerationProgress[]>([]);
   const [generated, setGenerated] = useState<AgentConfigData | null>(null);
   const [editMode, setEditMode] = useState(false);
+
+  // Image editing state
+  const [uploadingImage, setUploadingImage] = useState(false);
+  const [regeneratingImage, setRegeneratingImage] = useState(false);
+  const [imagePrompt, setImagePrompt] = useState("");
 
   // Saving state
   const [saving, setSaving] = useState(false);
@@ -139,6 +146,19 @@ export default function SettingsPage() {
     setStatus(null);
     setProgressLog([]);
     setGeneratingStep("Starting...");
+
+    // Ensure reference photo is uploaded before variant generation
+    if (agentType === "variant" && profile.photo) {
+      try {
+        await fetch(`${API_URL}/user/photo`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ photo: profile.photo }),
+        });
+      } catch (err) {
+        console.warn("Failed to upload reference photo:", err);
+      }
+    }
 
     const result = await generateAgentConfigStream(
       {
@@ -381,35 +401,17 @@ export default function SettingsPage() {
                 </div>
               </div>
 
-              {/* Video Mode Toggle */}
-              <div className="rounded-xl border border-amber-200 bg-amber-50/50 p-4">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <label className="block text-xs font-medium text-slate-700">
-                      Video Avatars (MuseTalk)
-                    </label>
-                    <p className="mt-0.5 text-[11px] text-slate-400">
-                      Enable lip-synced video avatars during meetings. Requires a GPU on the server.
-                    </p>
-                  </div>
-                  <button
-                    onClick={() => setProfile((prev) => ({ ...prev, videoMode: !prev.videoMode }))}
-                    className={`relative h-6 w-11 shrink-0 rounded-full transition-colors ${
-                      profile.videoMode ? "bg-emerald-500" : "bg-slate-300"
-                    }`}
-                  >
-                    <span
-                      className={`absolute top-0.5 left-0.5 h-5 w-5 rounded-full bg-white shadow transition-transform ${
-                        profile.videoMode ? "translate-x-5" : "translate-x-0"
-                      }`}
-                    />
-                  </button>
-                </div>
-                {profile.videoMode && (
-                  <p className="mt-2 text-[11px] text-amber-600 font-medium">
-                    ⚠ Video mode needs MuseTalk running on port 8001 with a compatible GPU. Without it, meetings will use CSS animations.
+              {/* Video mode info — server-controlled */}
+              <div className="rounded-xl border border-slate-200 bg-slate-50/50 p-4">
+                <div>
+                  <label className="block text-xs font-medium text-slate-700">
+                    Video Avatars
+                  </label>
+                  <p className="mt-0.5 text-[11px] text-slate-400">
+                    Video call mode is controlled by the server based on GPU capabilities.
+                    Run <code className="bg-slate-200 px-1 rounded text-[10px]">python check_gpu.py</code> in the backend folder and set <code className="bg-slate-200 px-1 rounded text-[10px]">USE_VIDEO_CALL=true</code> in .env if your GPU supports it (16+ GB VRAM).
                   </p>
-                )}
+                </div>
               </div>
 
               <button
@@ -570,17 +572,111 @@ export default function SettingsPage() {
                 <div className="mt-5 grid gap-4 sm:grid-cols-2">
                   {/* Left column: identity + image preview */}
                   <div className="space-y-3">
-                    {/* Image preview */}
-                    {generated.image && (
-                      <div className="mb-3">
-                        <label className="mb-1 block text-xs font-medium text-slate-500">Generated Portrait</label>
-                        <img
-                          src={generated.image}
-                          alt={generated.variant}
-                          className="h-40 w-40 rounded-xl object-cover border border-slate-200 shadow-sm"
-                        />
+                    {/* Image preview + management */}
+                    <div className="mb-3">
+                      <label className="mb-1 block text-xs font-medium text-slate-500">Portrait</label>
+                      <div className="flex items-start gap-3">
+                        {generated.image ? (
+                          <div className="relative">
+                            <img
+                              src={generated.image.startsWith("/images/") ? generated.image : `/images/${generated.image}`}
+                              alt={generated.variant}
+                              className="h-40 w-40 rounded-xl object-cover border border-slate-200 shadow-sm"
+                            />
+                            <button
+                              onClick={() => updateGenField("image", "")}
+                              className="absolute -top-1.5 -right-1.5 flex h-5 w-5 items-center justify-center rounded-full bg-red-500 text-white text-xs shadow hover:bg-red-600"
+                              title="Remove image"
+                            >
+                              ×
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="flex h-40 w-40 items-center justify-center rounded-xl border-2 border-dashed border-slate-200 bg-slate-50">
+                            <span className="text-5xl select-none">{generated.emoji || "🤖"}</span>
+                          </div>
+                        )}
+                        <div className="flex flex-col gap-2">
+                          {/* Upload custom image */}
+                          <label className={`cursor-pointer rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-xs font-medium text-slate-600 transition hover:bg-slate-100 text-center ${uploadingImage ? "opacity-50 pointer-events-none" : ""}`}>
+                            {uploadingImage ? "Uploading..." : "Upload Image"}
+                            <input
+                              type="file"
+                              accept="image/*"
+                              className="hidden"
+                              onChange={async (e) => {
+                                const file = e.target.files?.[0];
+                                if (!file) return;
+                                if (file.size > 5 * 1024 * 1024) {
+                                  setStatus({ type: "error", msg: "Image must be under 5 MB." });
+                                  return;
+                                }
+                                setUploadingImage(true);
+                                const reader = new FileReader();
+                                reader.onload = async () => {
+                                  const dataUri = reader.result as string;
+                                  const result = await uploadAgentImage(generated.id, dataUri);
+                                  if (result.image) {
+                                    updateGenField("image", result.image);
+                                  } else if (result.error) {
+                                    setStatus({ type: "error", msg: result.error });
+                                  }
+                                  setUploadingImage(false);
+                                };
+                                reader.readAsDataURL(file);
+                                e.target.value = "";
+                              }}
+                            />
+                          </label>
+                          {/* Regenerate with AI */}
+                          <button
+                            onClick={async () => {
+                              const prompt = generated.image_prompt || imagePrompt;
+                              if (!prompt) {
+                                setStatus({ type: "error", msg: "No image prompt available. Enter one below." });
+                                return;
+                              }
+                              setRegeneratingImage(true);
+                              const result = await regenerateAgentImage(generated.id, prompt, agentType);
+                              if (result.image) {
+                                updateGenField("image", result.image);
+                              } else if (result.error) {
+                                setStatus({ type: "error", msg: result.error });
+                              }
+                              setRegeneratingImage(false);
+                            }}
+                            disabled={regeneratingImage}
+                            className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-1.5 text-xs font-medium text-blue-700 transition hover:bg-blue-100 disabled:opacity-50"
+                          >
+                            {regeneratingImage ? (
+                              <span className="flex items-center gap-1.5">
+                                <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+                                Generating...
+                              </span>
+                            ) : "Regenerate Image"}
+                          </button>
+                        </div>
                       </div>
-                    )}
+                      {/* Image prompt (editable) */}
+                      {(generated.image_prompt || !generated.image) && (
+                        <div className="mt-2">
+                          <label className="mb-1 block text-[10px] font-medium text-slate-400">Image Prompt</label>
+                          <textarea
+                            value={generated.image_prompt || imagePrompt}
+                            onChange={(e) => {
+                              if (generated.image_prompt !== undefined) {
+                                updateGenField("image_prompt", e.target.value);
+                              } else {
+                                setImagePrompt(e.target.value);
+                              }
+                            }}
+                            rows={2}
+                            className="w-full rounded-lg border border-slate-200 bg-white px-3 py-1.5 text-[11px] text-slate-600 placeholder-slate-400 outline-none focus:border-blue-500 resize-none"
+                            placeholder="Describe the portrait you want generated..."
+                          />
+                        </div>
+                      )}
+                    </div>
                     <FieldInput label="Display Name" value={generated.variant}
                       onChange={(v) => updateGenField("variant", v)} />
                     <FieldInput label="ID (slug)" value={generated.id}

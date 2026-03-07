@@ -47,23 +47,74 @@ You join a virtual meeting room, pick your team of AI agents, type or speak your
 ## Architecture
 
 ```
-┌─────────────────────┐        WebSocket (ws://localhost:8000)        ┌──────────────────────────────┐
-│                     │ ◄──────────────────────────────────────────► │                              │
-│   Next.js Frontend  │    text messages + base64 audio streaming    │   FastAPI + AutoGen Backend  │
-│   (React, Tailwind) │                                              │                              │
-│   localhost:3001    │                                              │   localhost:8000             │
-└─────────────────────┘                                              └──────────┬───────────────────┘
-                                                                                │
-                                                                     ┌──────────┼──────────┐
-                                                                     │          │          │
-                                                               ┌─────┴───┐ ┌────┴────┐ ┌──┴──────────┐
-                                                               │ AutoGen │ │Edge TTS │ │ OpenRouter  │
-                                                               │ Group   │ │ (free)  │ │ LLM API    │
-                                                               │ Chat    │ │         │ │ (cloud)    │
-                                                               └─────────┘ └─────────┘ └─────────────┘
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                        BROWSER — Next.js (localhost:3001)                        │
+│                                                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────────────┐  │
+│  │ Your Tile│  │ Agent 1  │  │ Agent 2  │  │ Agent 3  │  │  Chat sidebar    │  │
+│  │ (webcam) │  │(speaking)│  │          │  │          │  │  (text + files)  │  │
+│  └────┬─────┘  └──────────┘  └──────────┘  └──────────┘  └──────────────────┘  │
+│       │                                                                          │
+│       ├── useLiveKitRoom ──── WebRTC mic + camera ──────────┐                   │
+│       ├── useEmotionDetection ── webcam frames (5s) ────────┼──┐                │
+│       └── useServerSTT / useSpeechRecognition (fallback) ───┼──┼──┐             │
+│                                                              │  │  │             │
+│  Controls: [🎤 Mute] [📷 Camera] [💬 Chat] [📞 Leave]      │  │  │             │
+└──────────────────────────────────────────────────────────────┼──┼──┼─────────────┘
+                                                               │  │  │
+               WebRTC (UDP, low-latency)  ─────────────────────┘  │  │
+               HTTPS POST /perception ────────────────────────────┘  │
+               WebSocket /ws/chat  + /ws/stt ────────────────────────┘
+                                                               │
+┌────────────────────┐                                         │
+│  LIVEKIT SERVER    │◄──── WebRTC audio/video ────────────────┘
+│  (Docker :7880)    │                                         │
+│  Echo cancellation │      WebSocket (text + audio)           │
+│  Noise suppression │                                         ▼
+│  Opus codec        │     ┌──────────────────────────────────────────────────────┐
+└────────┬───────────┘     │            BACKEND — FastAPI (localhost:8000)         │
+         │                 │                                                      │
+         │ WebRTC          │  livekit_room.py ── subscribes to user audio          │
+         └────────────────►│    └→ streams PCM to Deepgram STT                    │
+                           │    └→ returns transcripts                             │
+                           │                                                      │
+                           │  MeetingSession (AutoGen GroupChat)                   │
+                           │    ├── Agent 1 (persona + memory + emotion context)  │
+                           │    ├── Agent 2     "                                 │
+                           │    └── Agent N     "                                 │
+                           │                                                      │
+                           │  TTS Pipeline ── parallel sentence streaming          │
+                           │    └→ base64 MP3 chunks → WebSocket → browser        │
+                           │                                                      │
+                           │  perception.py ── Gemini Flash emotion analysis       │
+                           └──────────┬───────────┬───────────┬───────────────────┘
+                                      │           │           │
+                                ┌─────┴───┐ ┌────┴────┐ ┌────┴──────┐
+                                │Deepgram │ │OpenRouter│ │  Gemini   │
+                                │STT+TTS  │ │  LLM    │ │  Flash    │
+                                │(Nova-2) │ │ (cloud) │ │ (emotion) │
+                                └─────────┘ └─────────┘ └───────────┘
 ```
 
-**No GPU required for the default setup.** The LLM runs in the cloud via OpenRouter, and TTS uses Microsoft's free Edge TTS service. Everything else is CPU-based.
+### STT Priority Chain (automatic fallback)
+
+| Priority | Method | Latency | Requirement |
+|----------|--------|---------|-------------|
+| 1st | **LiveKit WebRTC + Deepgram** | ~100-300ms | LiveKit server + `DEEPGRAM_API_KEY` |
+| 2nd | **Deepgram direct** (`/ws/stt`) | ~200-400ms | `DEEPGRAM_API_KEY` only |
+| 3rd | **Browser SpeechRecognition** | ~300-500ms | Chrome/Edge (built-in, free) |
+| 4th | **Text chat only** | — | Always available |
+
+### TTS Providers
+
+| Provider | Set in `.env` | Latency | Cost |
+|----------|---------------|---------|------|
+| `edge` (default) | `TTS_PROVIDER=edge` | ~400ms | Free |
+| `deepgram` | `TTS_PROVIDER=deepgram` | ~150-200ms | $200 free credit |
+| `cartesia` | `TTS_PROVIDER=cartesia` | ~100ms | Paid |
+| `elevenlabs` | `TTS_PROVIDER=elevenlabs` | ~300ms | Paid |
+
+**No GPU required for the default setup.** The LLM runs in the cloud via OpenRouter, TTS uses Microsoft's free Edge TTS. Everything else is CPU-based.
 
 ---
 
@@ -100,12 +151,13 @@ If you want AI-generated lip-sync video avatars instead of CSS animations:
 ### Backend (Python)
 
 | Library | Version | Purpose | License |
-|---------|---------|---------|---------|
+|---------|---------|---------|--------|
 | [AutoGen](https://github.com/microsoft/autogen) | ≥0.4.0 | Multi-agent orchestration (SelectorGroupChat) | MIT |
 | [FastAPI](https://fastapi.tiangolo.com/) | ≥0.115.0 | WebSocket server + REST API | MIT |
 | [Uvicorn](https://www.uvicorn.org/) | ≥0.34.0 | ASGI server | BSD-3 |
-| [Edge TTS](https://github.com/rany2/edge-tts) | latest | Free text-to-speech via Microsoft Edge neural voices | GPL-3.0 |
-| [aiohttp](https://docs.aiohttp.org/) | latest | Async HTTP client (MuseTalk integration) | Apache-2.0 |
+| [LiveKit Server SDK](https://github.com/livekit/python-sdks) | latest | WebRTC room management, audio subscription | Apache-2.0 |
+| [Edge TTS](https://github.com/rany2/edge-tts) | latest | Free text-to-speech (default provider) | GPL-3.0 |
+| [aiohttp](https://docs.aiohttp.org/) | latest | Async HTTP/WebSocket client (Deepgram, MuseTalk) | Apache-2.0 |
 | [python-dotenv](https://github.com/theskumar/python-dotenv) | latest | Environment variable management | BSD-3 |
 | [Loguru](https://github.com/Delgan/loguru) | latest | Beautiful logging | MIT |
 | [websockets](https://websockets.readthedocs.io/) | ≥14.0 | WebSocket protocol support | BSD-3 |
@@ -113,10 +165,11 @@ If you want AI-generated lip-sync video avatars instead of CSS animations:
 ### Frontend (TypeScript)
 
 | Library | Version | Purpose | License |
-|---------|---------|---------|---------|
+|---------|---------|---------|--------|
 | [Next.js](https://nextjs.org/) | 16.1.6 | React framework with App Router | MIT |
 | [React](https://react.dev/) | 19.2.3 | UI library | MIT |
 | [Tailwind CSS](https://tailwindcss.com/) | 4.x | Utility-first CSS framework | MIT |
+| [livekit-client](https://github.com/livekit/client-sdk-js) | latest | WebRTC client for LiveKit rooms | Apache-2.0 |
 | [TypeScript](https://www.typescriptlang.org/) | 5.x | Type safety | Apache-2.0 |
 
 ### Optional: MuseTalk (Lip-Sync Video)
@@ -133,7 +186,10 @@ If you want AI-generated lip-sync video avatars instead of CSS animations:
 | Service | Purpose | Cost |
 |---------|---------|------|
 | [OpenRouter](https://openrouter.ai/) | LLM API (Llama, GPT, Claude, etc.) | Pay-per-token (many free models available) |
-| Microsoft Edge TTS | Neural text-to-speech | **Free** |
+| [Deepgram](https://deepgram.com/) | STT (Nova-2) + optional TTS (Aura) | **$200 free credit**, no CC required |
+| [Gemini Flash](https://ai.google.dev/) | Emotion/perception analysis from webcam | Free tier available |
+| Microsoft Edge TTS | Neural text-to-speech (default) | **Free** |
+| [LiveKit](https://livekit.io/) | WebRTC SFU server (self-hosted via Docker) | **Free** (open source) |
 
 ---
 
@@ -171,16 +227,42 @@ copy backend\.env.example backend\.env
 cp backend/.env.example backend/.env
 ```
 
-Edit `backend/.env` and add your OpenRouter API key:
+Edit `backend/.env` and add your API keys:
 
 ```env
+# Required
 OPENROUTER_API_KEY=sk-or-v1-your-key-here
 OPENROUTER_MODEL=meta-llama/llama-4-maverick
+
+# Recommended — enables high-quality voice input + optional fast TTS
+DEEPGRAM_API_KEY=your-deepgram-key-here   # Free $200 credit at deepgram.com
+TTS_PROVIDER=edge                          # edge (free) | deepgram (~2x faster) | cartesia | elevenlabs
 ```
 
-> Get a free API key at [openrouter.ai](https://openrouter.ai). Many models (like Llama) have free tiers.
+> **API keys:**
+> - [openrouter.ai](https://openrouter.ai) — LLM. Many models (like Llama) have free tiers.
+> - [deepgram.com](https://console.deepgram.com/signup) — STT + TTS. **$200 free credit**, no credit card.
 
-Run the backend:
+### 3. Start LiveKit (recommended — enables WebRTC voice)
+
+Requires [Docker](https://docs.docker.com/desktop/install/windows-install/).
+
+```powershell
+# Option A: Use the included script (Windows)
+.\start_livekit.ps1
+
+# Option B: Manual
+docker run -d --name metrastrome-livekit \
+  -p 7880:7880 -p 7881:7881 -p 7882:7882/udp \
+  --restart unless-stopped \
+  livekit/livekit-server --dev
+```
+
+LiveKit env vars are already set in `.env.example` — no changes needed for local dev.
+
+> **Don't want LiveKit?** Just comment out the `LIVEKIT_*` vars in `.env`. Voice falls back to Deepgram direct STT or browser speech recognition.
+
+### 4. Run the backend
 
 ```bash
 python backend/main.py
@@ -190,11 +272,11 @@ You should see:
 
 ```
 Loaded 8 agents from config
-Starting server with 8 agent(s)
+[LiveKit] Joined room: ...         ← confirms WebRTC is active
 Uvicorn running on http://0.0.0.0:8000
 ```
 
-### 3. Start the Frontend
+### 5. Start the Frontend
 
 ```bash
 cd frontend
@@ -202,9 +284,11 @@ npm install
 npm run dev
 ```
 
-### 4. Open in your browser
+### 6. Open in your browser
 
 Go to **http://localhost:3001**, enter your name, pick your agents, and start brainstorming!
+
+The header shows **"WebRTC"** when LiveKit is active, or **"Connected"** when using WebSocket fallback.
 
 ---
 
@@ -212,39 +296,48 @@ Go to **http://localhost:3001**, enter your name, pick your agents, and start br
 
 ```
 metrastrome/
-├── agents.config.json          # 🎯 Agent definitions (edit this to customize!)
+├── agents.config.json              # 🎯 Agent definitions (edit this to customize!)
+├── start_livekit.ps1               # LiveKit server manager script (Windows)
 ├── README.md
 │
-├── backend/                    # Python FastAPI + AutoGen server
+├── backend/                        # Python FastAPI + AutoGen server
 │   ├── agents/
-│   │   └── base_agent.py       # Loads agents from JSON, builds system prompts
-│   ├── main.py                 # WebSocket server, TTS, group chat orchestration
+│   │   └── base_agent.py           # Loads agents from JSON, builds system prompts
+│   ├── main.py                     # WebSocket server, TTS, group chat orchestration
+│   ├── livekit_room.py             # LiveKit WebRTC room manager (audio → Deepgram STT)
+│   ├── livekit_service.py          # LiveKit token generation + health checks
+│   ├── perception.py               # Emotion detection via Gemini Flash
+│   ├── tts_providers.py            # TTS abstraction (edge/deepgram/cartesia/elevenlabs)
+│   ├── check_gpu.py                # GPU capability detection
 │   ├── requirements.txt
 │   ├── .env.example
-│   └── .env                    # Your API keys (gitignored)
+│   └── .env                        # Your API keys (gitignored)
 │
-├── frontend/                   # Next.js 16 + React 19 + Tailwind v4
+├── frontend/                       # Next.js 16 + React 19 + Tailwind v4
 │   ├── src/
 │   │   ├── app/
-│   │   │   ├── page.tsx        # Landing page — agent selection grid
+│   │   │   ├── page.tsx            # Landing page — agent selection grid
 │   │   │   └── meet/
-│   │   │       └── page.tsx    # Meeting room entry point
+│   │   │       └── page.tsx        # Meeting room entry point
 │   │   ├── components/
-│   │   │   ├── MeetingRoom.tsx # Main meeting UI — chat, audio, WebSocket
-│   │   │   ├── ParticipantTile.tsx  # Agent video tiles with animations
-│   │   │   └── MeetingControls.tsx  # Mic, camera, chat toggle buttons
+│   │   │   ├── MeetingRoom.tsx     # Main meeting UI — tiles, chat, WebSocket, LiveKit
+│   │   │   ├── ParticipantTile.tsx # Agent video tiles with speaking animations
+│   │   │   └── MeetingControls.tsx # Mic, camera, chat toggle buttons
 │   │   ├── hooks/
-│   │   │   └── useSpeechRecognition.ts  # Browser speech-to-text
+│   │   │   ├── useLiveKitRoom.ts   # WebRTC connection to LiveKit (mic + camera)
+│   │   │   ├── useServerSTT.ts     # Deepgram direct STT via /ws/stt (fallback)
+│   │   │   ├── useSpeechRecognition.ts  # Browser speech-to-text (last resort)
+│   │   │   └── useEmotionDetection.ts   # Webcam → emotion analysis
 │   │   └── lib/
-│   │       └── agents.ts       # Dynamic agent fetching from backend API
+│   │       └── agents.ts           # Dynamic agent fetching from backend API
 │   └── public/
-│       └── images/             # Agent avatar photos (optional)
+│       └── images/                 # Agent avatar photos (optional)
 │
-├── musetalk/                   # Optional: MuseTalk lip-sync (disabled by default)
-│   ├── service.py              # FastAPI wrapper on port 8001
-│   └── ...                     # MuseTalk model code and weights
+├── musetalk/                       # Optional: MuseTalk lip-sync (disabled by default)
+│   ├── service.py                  # FastAPI wrapper on port 8001
+│   └── ...                         # MuseTalk model code and weights
 │
-└── infrastructure/             # Docker configs (optional, for LiveKit)
+└── infrastructure/                 # Docker configs (optional)
 ```
 
 ---
@@ -312,19 +405,25 @@ Run `edge-tts --list-voices` for the full list.
 
 ---
 
-## Optional: Enable MuseTalk Lip-Sync Video
+## Optional: Enable Video Call (MuseTalk Lip-Sync)
 
-> Only recommended for RTX 4080+ GPUs. On lower-end GPUs, the CSS animations are a better experience.
+> Only recommended for GPUs with 16+ GB VRAM (RTX 4090/5090). On lower-end GPUs, CSS speaking animations are used instead.
 
-1. Set up MuseTalk following the instructions in `musetalk/README.md`
-2. Edit `backend/.env`:
+1. Check your GPU capabilities:
+
+```bash
+cd backend
+python check_gpu.py
+```
+
+2. If recommended, edit `backend/.env`:
 
 ```env
-MUSETALK_ENABLED=true
+USE_VIDEO_CALL=true
 MUSETALK_URL=http://localhost:8001
 ```
 
-3. Start the MuseTalk service:
+3. Set up and start the MuseTalk service:
 
 ```bash
 cd musetalk
@@ -341,7 +440,13 @@ python service.py
 |----------|----------|---------|-------------|
 | `OPENROUTER_API_KEY` | **Yes** | — | Your OpenRouter API key |
 | `OPENROUTER_MODEL` | No | `meta-llama/llama-4-maverick` | LLM model to use |
-| `MUSETALK_ENABLED` | No | `false` | Enable lip-sync video (needs GPU) |
+| `DEEPGRAM_API_KEY` | Recommended | — | Deepgram API key (STT + optional TTS). Free $200 credit |
+| `TTS_PROVIDER` | No | `edge` | TTS engine: `edge` \| `deepgram` \| `cartesia` \| `elevenlabs` |
+| `LIVEKIT_URL` | No | `ws://localhost:7880` | LiveKit server URL (WebRTC) |
+| `LIVEKIT_API_KEY` | No | `devkey` | LiveKit API key (dev mode default) |
+| `LIVEKIT_API_SECRET` | No | `secret` | LiveKit API secret (dev mode default) |
+| `KIE_API_KEY` | No | — | Kie.ai image generation key |
+| `USE_VIDEO_CALL` | No | `false` | Enable lip-sync video (needs 16+ GB VRAM GPU) |
 | `MUSETALK_URL` | No | `http://localhost:8001` | MuseTalk service URL |
 
 ### Frontend (`frontend/.env.local`)
@@ -370,13 +475,15 @@ python backend/main.py --port 8080
 
 ## How It Works
 
-1. **You join a meeting room** and pick which Tapan variants you want in your brainstorming session
-2. **You type or speak** your idea or question
-3. **AutoGen's SelectorGroupChat** dynamically picks the most relevant agent to respond based on context
-4. **The agent responds** with a short, conversational answer (1-3 sentences, like a real call)
-5. **Edge TTS** converts the response to audio, which streams back to your browser
-6. **The agent's tile animates** — photo zooms, glow ring pulses, equalizer bars dance
-7. **The conversation continues** naturally, with agents building on each other's points
+1. **You join a meeting room** and pick which variants you want in your brainstorming session
+2. **You speak or type** your idea — voice goes through LiveKit WebRTC → Deepgram STT (or type in chat)
+3. **Your emotion is detected** from your webcam every 5 seconds via Gemini Flash — agents adapt their tone
+4. **AutoGen's SelectorGroupChat** dynamically picks the most relevant agent to respond based on context
+5. **The agent responds** with a short, conversational answer (1-3 sentences, like a real call)
+6. **TTS converts the response to audio** — sentences are generated in parallel for low latency
+7. **The agent's tile animates** — photo zooms, glow ring pulses, equalizer bars dance
+8. **You can interrupt anytime** — speaking mid-agent cancels their audio immediately
+9. **The conversation continues** naturally, with agents building on each other's points
 
 ---
 
@@ -395,6 +502,8 @@ python backend/main.py --port 8080
 This project stands on the shoulders of amazing open-source work:
 
 - **[Microsoft AutoGen](https://github.com/microsoft/autogen)** — The multi-agent framework that makes the group chat magic possible
+- **[LiveKit](https://livekit.io/)** — Open-source WebRTC SFU for real-time audio/video transport
+- **[Deepgram](https://deepgram.com/)** — Lightning-fast speech-to-text (Nova-2) and text-to-speech (Aura)
 - **[FastAPI](https://fastapi.tiangolo.com/)** — Blazing fast Python web framework by Sebastián Ramírez
 - **[Next.js](https://nextjs.org/)** by Vercel — The React framework for the web
 - **[Tailwind CSS](https://tailwindcss.com/)** — Utility-first CSS that made the UI possible in record time
@@ -412,12 +521,12 @@ If you use this project, build on it, or learn from it — **a credit or mention
 
 This is a fun, experimental project. PRs welcome! Some ideas:
 
-- 🎤 **Better STT** — integrate Whisper for more accurate speech recognition
 - 🌍 **Multi-language support** — agents that speak different languages
 - 🖼️ **AI-generated agent portraits** — auto-generate images from backstories
 - 📱 **Mobile layout** — responsive meeting room for phones
 - 🔌 **Plugin system** — let agents call external tools (search, code execution, etc.)
 - 🎭 **More agent personalities** — submit your own via PR to `agents.config.json`!
+- 🔊 **LiveKit audio output** — route agent TTS audio through WebRTC instead of WebSocket
 
 ---
 
