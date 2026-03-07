@@ -198,7 +198,7 @@ If you want AI-generated lip-sync video avatars instead of CSS animations:
 ### 1. Clone the repo
 
 ```bash
-git clone https://github.com/your-username/metrastrome.git
+git clone https://github.com/tapankumarpatro/metrastrome.git
 cd metrastrome
 ```
 
@@ -265,13 +265,16 @@ LiveKit env vars are already set in `.env.example` — no changes needed for loc
 ### 4. Run the backend
 
 ```bash
-python backend/main.py
+cd backend
+python main.py
+# OR if you prefer uvicorn directly:
+# uvicorn main:app --host 0.0.0.0 --port 8000 --reload
 ```
 
 You should see:
 
 ```
-Loaded 8 agents from config
+Loaded 9 agents from config
 [LiveKit] Joined room: ...         ← confirms WebRTC is active
 Uvicorn running on http://0.0.0.0:8000
 ```
@@ -303,11 +306,14 @@ metrastrome/
 ├── backend/                        # Python FastAPI + AutoGen server
 │   ├── agents/
 │   │   └── base_agent.py           # Loads agents from JSON, builds system prompts
-│   ├── main.py                     # WebSocket server, TTS, group chat orchestration
+│   ├── main.py                     # WebSocket server, 3-phase conversation orchestrator, TTS
 │   ├── livekit_room.py             # LiveKit WebRTC room manager (audio → Deepgram STT)
 │   ├── livekit_service.py          # LiveKit token generation + health checks
 │   ├── perception.py               # Emotion detection via Gemini Flash
 │   ├── tts_providers.py            # TTS abstraction (edge/deepgram/cartesia/elevenlabs)
+│   ├── memory_store.py             # ChromaDB dual-layer vector memory (shared + per-agent)
+│   ├── conversation_store.py       # SQLite persistence (sessions, messages, agent notes)
+│   ├── file_utils.py               # File text extraction (PDF, DOCX, CSV, code, etc.)
 │   ├── check_gpu.py                # GPU capability detection
 │   ├── requirements.txt
 │   ├── .env.example
@@ -478,12 +484,16 @@ python backend/main.py --port 8080
 1. **You join a meeting room** and pick which variants you want in your brainstorming session
 2. **You speak or type** your idea — voice goes through LiveKit WebRTC → Deepgram STT (or type in chat)
 3. **Your emotion is detected** from your webcam every 5 seconds via Gemini Flash — agents adapt their tone
-4. **AutoGen's SelectorGroupChat** dynamically picks the most relevant agent to respond based on context
-5. **The agent responds** with a short, conversational answer (1-3 sentences, like a real call)
-6. **TTS converts the response to audio** — sentences are generated in parallel for low latency
-7. **The agent's tile animates** — photo zooms, glow ring pulses, equalizer bars dance
-8. **You can interrupt anytime** — speaking mid-agent cancels their audio immediately
-9. **The conversation continues** naturally, with agents building on each other's points
+4. **The 3-phase conversation orchestrator** plans the response:
+   - **Phase 1 (Plan):** Scores all agents by expertise relevance → decides who speaks and how (zero LLM calls, ~0ms)
+   - **Phase 2 (Primary):** Lead agent gives a detailed answer; supporting agents add perspectives or brief reactions
+   - **Phase 3 (Follow-up):** Agents react to each other — agreeing, pushing back, building on points (like a real call)
+5. **Response length varies naturally** — quick 1-sentence reactions, normal 2-4 sentence replies, or detailed 4-8 sentence deep dives
+6. **Agents can [pass]** if they have nothing meaningful to add — no forced robotic one-liners
+7. **TTS converts each response to audio** — sentences are generated in parallel for low latency
+8. **The agent's tile animates** — photo zooms, glow ring pulses, equalizer bars dance
+9. **You can interrupt anytime** — speaking mid-agent cancels their audio immediately
+10. **Agents remember you** — dual-layer memory (ChromaDB) persists context across sessions
 
 ---
 
@@ -527,6 +537,8 @@ This is a fun, experimental project. PRs welcome! Some ideas:
 - 🔌 **Plugin system** — let agents call external tools (search, code execution, etc.)
 - 🎭 **More agent personalities** — submit your own via PR to `agents.config.json`!
 - 🔊 **LiveKit audio output** — route agent TTS audio through WebRTC instead of WebSocket
+- 💬 **Conversation tuning** — tweak the 3-phase orchestrator weights for different conversation styles
+- 📊 **Analytics dashboard** — visualize agent speaking patterns, topic coverage, memory usage
 
 ---
 

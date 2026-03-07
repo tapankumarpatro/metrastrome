@@ -6,19 +6,27 @@ autogen-ext[openai]>=0.4.0
 fastapi>=0.115.0
 uvicorn[standard]>=0.34.0
 websockets>=14.0
+python-multipart             # file uploads
 
 # TTS (Microsoft Edge neural voices)
 edge-tts
 
-# HTTP client (for OpenRouter, Kie.ai API calls)
+# HTTP client (for OpenRouter, Kie.ai, Deepgram)
 aiohttp
+requests
 
-# Environment
+# Environment + logging
 python-dotenv
-
-# Logging
 loguru
 
-# LiveKit WebRTC (optional — for real-time A/V transport)
+# Memory (ChromaDB vector store for dual-layer agent memory)
+chromadb
+
+# File extraction (chat file sharing: PDF, DOCX, images)
+PyPDF2
+python-docx
+pillow
+
+# LiveKit WebRTC (real-time A/V transport + Deepgram STT)
 livekit
 livekit-api
